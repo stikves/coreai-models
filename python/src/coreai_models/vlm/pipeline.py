@@ -123,6 +123,7 @@ async def _async_export_vlm(config: VLMExportConfig) -> str:
         config.hf_model_id,
         loaded["text_config"],
         loaded["vision_config"],
+        loaded.get("image_token_index", 32000),
         config.compression,
     )
 
@@ -270,6 +271,7 @@ def _write_metadata(
     hf_model_id: str,
     text_config: Any,
     vision_config: Any,
+    image_token_index: int,
     compression: str,
 ) -> None:
     """Write metadata.json (0.2 schema) with VLM multi-component assets."""
@@ -293,7 +295,7 @@ def _write_metadata(
             "image_size": image_size,
             "patch_size": patch_size,
             "image_token_count": num_patches,
-            "image_token_id": 32000,
+            "image_token_id": image_token_index,
         },
         "source": {
             "model_definition": "torch",

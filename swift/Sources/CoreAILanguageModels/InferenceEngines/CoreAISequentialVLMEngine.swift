@@ -530,10 +530,12 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         textEmbeddings: NDArray,
         imageEmbeddings: NDArray,
         tokens: [Int32]
-    ) -> NDArray {
+    ) throws -> NDArray {
         let imageTokenId = config.visionConfig.imageTokenId
-        let hiddenDim = textEmbeddings.shape.last ?? 0
-        let scalarType = textEmbeddings.scalarType
+        guard let hiddenDim = textEmbeddings.shape.last, hiddenDim > 0 else {
+            throw InferenceRuntimeError.invalidState(
+                "scatterMerge: text embeddings have invalid shape \(textEmbeddings.shape)")
+        }
 
         // Find image placeholder positions
         var imagePositions: [Int] = []
@@ -545,20 +547,33 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
         CLILogger.log("  - scatter merge: \(imagePositions.count) image positions, hidden_dim=\(hiddenDim)")
 
-        // Create a copy of the text embeddings as our merge target.
         var merged = textEmbeddings
-
         guard !imagePositions.isEmpty else { return merged }
 
         let imageTokenCount = config.visionConfig.imageTokenCount
+        guard imagePositions.count == imageTokenCount else {
+            throw InferenceRuntimeError.invalidArgument(
+                "scatterMerge: found \(imagePositions.count) image placeholder tokens, "
+                + "expected \(imageTokenCount) from config. Check prompt template.")
+        }
 
-        // Perform the scatter: copy image embedding vectors into placeholder positions
-        // Use Float16 views since both tensors are float16.
+        let seqLen = textEmbeddings.shape.count >= 2 ? textEmbeddings.shape[1] : 0
+        let imgSeqLen = imageEmbeddings.shape.count >= 2 ? imageEmbeddings.shape[1] : 0
+        guard imgSeqLen >= imageTokenCount else {
+            throw InferenceRuntimeError.invalidArgument(
+                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(imageTokenCount)")
+        }
+
+        // Validate all positions are within bounds
+        guard let maxPos = imagePositions.last, maxPos < seqLen else {
+            throw InferenceRuntimeError.invalidArgument(
+                "scatterMerge: image position \(imagePositions.last ?? -1) exceeds sequence length \(seqLen)")
+        }
+
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
                 for (i, pos) in imagePositions.enumerated() {
-                    guard i < imageTokenCount else { break }
                     let srcOffset = i * hiddenDim
                     let dstOffset = pos * hiddenDim
                     (mergedPtr + dstOffset).update(
@@ -684,7 +699,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let textEmbeddings = try await embedTokens(tokens[...])
 
         // Step 2: Scatter merge -- replace image placeholder positions with vision embeddings
-        let merged = scatterMerge(
+        let merged = try scatterMerge(
             textEmbeddings: textEmbeddings,
             imageEmbeddings: embeddedInput.embeddings,
             tokens: tokens

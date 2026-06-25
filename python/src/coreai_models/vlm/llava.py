@@ -205,6 +205,7 @@ def load_llava_components(
 
     # We're done with the HF wrapper. Hold a direct ref to `vision_tower_hf`
     # (its `vision_tower` submodule) so we can drop the rest and free memory.
+    image_token_index = getattr(hf_model.config, "image_token_index", 32000)
     del hf_model
 
     vision = LLaVAVisionTower(vision_tower_hf, projector)
@@ -216,4 +217,5 @@ def load_llava_components(
         "language_model": language_model,
         "vision_config": vision_config,
         "text_config": text_config,
+        "image_token_index": image_token_index,
     }
