@@ -531,19 +531,22 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
 
-            var generatedText = ""
+            var generatedTokens: [Int] = []
+            var previousText = ""
             for try await output in tokenStream {
                 let token = output.tokenId
                 if eosTokenIds.contains(token) { break }
-                let piece = tokenizer.decode(tokens: [Int(token)])
-                generatedText += piece
-                print(piece, terminator: "")
+                generatedTokens.append(Int(token))
+                let fullText = tokenizer.decode(tokens: generatedTokens)
+                let delta = String(fullText.dropFirst(previousText.count))
+                previousText = fullText
+                print(delta, terminator: "")
                 fflush(stdout)
             }
             print()
 
             InstrumentsProfiler.endInference(
-                generatedTokens: tokenizer.encode(text: generatedText).count, signpostID: inferenceID)
+                generatedTokens: generatedTokens.count, signpostID: inferenceID)
             await PerformanceMetrics.shared.endOverallTiming()
             await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
             return
