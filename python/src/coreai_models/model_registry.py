@@ -13,7 +13,7 @@ CLI:
     uv run coreai.model.registry --list-models --type utility
     uv run coreai.model.registry --model-info clip-vit-b32 --type utility --as-export-args
 
-`--type` selects the preset table (`llm`, `diffusion`, or `utility`).
+`--type` selects the preset table (`llm`, `diffusion`, `vlm`, or `utility`).
 `--platform` (`macOS` / `iOS`) filters LLM variants and utility model platforms.
 """
 
@@ -107,6 +107,36 @@ LLM_PRESETS: list[ModelPreset] = [
         131072,
     ),
     ModelPreset(
+        "llama-3.2-1b-instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "llama-3.2",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        131072,
+    ),
+    ModelPreset(
+        "llama-3.1-8b-instruct",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "llama-3.1",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        131072,
+    ),
+    ModelPreset(
+        "llama-4-scout-17b-16e-instruct",
+        "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "llama-4",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        10485760,
+    ),
+    ModelPreset(
         "mistral-7b-instruct-v0.3",
         "mistralai/Mistral-7B-Instruct-v0.3",
         "mistral",
@@ -162,6 +192,17 @@ LLM_PRESETS: list[ModelPreset] = [
         4096,
         compression_config="models/qwen3/qwen3_4b_mixed_4bit_8bit.yaml",
     ),
+    ModelPreset(
+        "llama-3.2-1b-instruct",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "llama-3.2",
+        "llm",
+        "iOS",
+        "none",
+        "float16",
+        4096,
+        compression_config="models/llama3/llama_3_2_1b_mixed_4bit_8bit.yaml",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -209,6 +250,23 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "float16",
         None,
         notes="4bit recommended; use --compression none for full precision",
+    ),
+]
+
+# ---------------------------------------------------------------------------
+# VLM presets
+# ---------------------------------------------------------------------------
+
+VLM_PRESETS: list[ModelPreset] = [
+    ModelPreset(
+        "llava-1.5-7b",
+        "llava-hf/llava-1.5-7b-hf",
+        "llava",
+        "vlm",
+        "macOS",
+        "none",
+        "float16",
+        4096,
     ),
 ]
 
@@ -344,12 +402,12 @@ UTILITY_PRESETS: list[UtilityModel] = [
 # Lookups
 # ---------------------------------------------------------------------------
 
-KNOWN_TYPES = ("llm", "diffusion", "utility")
+KNOWN_TYPES = ("llm", "diffusion", "vlm", "utility")
 KNOWN_VARIANTS = ("macOS", "iOS")
 
 
 def all_presets() -> list[ModelPreset]:
-    return LLM_PRESETS + DIFFUSION_PRESETS
+    return LLM_PRESETS + DIFFUSION_PRESETS + VLM_PRESETS
 
 
 def all_utility_models() -> list[UtilityModel]:
@@ -361,6 +419,8 @@ def presets_for_type(model_type: str) -> list[ModelPreset]:
         return LLM_PRESETS
     if model_type == "diffusion":
         return DIFFUSION_PRESETS
+    if model_type == "vlm":
+        return VLM_PRESETS
     if model_type == "utility":
         raise ValueError(
             "Use all_utility_models() for utility type — UtilityModel is a different schema."
@@ -657,7 +717,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--family",
-        help="Family filter (e.g. qwen3). For --type utility, filters by model_type.",
+        help="Family filter (e.g. qwen3, llama-3.2). For --type utility, filters by model_type.",
     )
     parser.add_argument(
         "--task",
@@ -849,18 +909,18 @@ def _action_list_models(args: argparse.Namespace) -> None:
 
 
 def _print_all_tables(presets: list[ModelPreset], args: argparse.Namespace) -> None:
-    llm = [p for p in presets if p.type == "llm"]
+    llm_vlm = [p for p in presets if p.type in ("llm", "vlm")]
     diffusion = [p for p in presets if p.type == "diffusion"]
     util = filter_utility_models(model_type=args.family, task=args.task, platform=args.platform)
 
-    if llm:
-        print("=== LLM ===")
+    if llm_vlm:
+        print("=== LLM / VLM ===")
         print(_format_text_header(show_type=False))
-        for p in llm:
+        for p in llm_vlm:
             print(_format_text_preset_row(p, show_type=False))
 
     if diffusion:
-        if llm:
+        if llm_vlm:
             print()
         print("=== Diffusion ===")
         print(_format_diffusion_header())
@@ -868,7 +928,7 @@ def _print_all_tables(presets: list[ModelPreset], args: argparse.Namespace) -> N
             print(_format_diffusion_row(p))
 
     if util:
-        if llm or diffusion:
+        if llm_vlm or diffusion:
             print()
         print("=== Image, Text, Audio, and More ===")
         print(_format_utility_header())
@@ -1010,7 +1070,7 @@ def _action_model_info(args: argparse.Namespace) -> None:
 def _action_summary() -> None:
     """No-args default — short summary, suggest the next commands."""
     print("coreai.model.registry — model catalogue\n")
-    for t in ("llm", "diffusion"):
+    for t in ("llm", "diffusion", "vlm"):
         presets = filter_presets(presets_for_type(t))
         unique_models = len({p.short_name for p in presets})
         fams = families(t)
