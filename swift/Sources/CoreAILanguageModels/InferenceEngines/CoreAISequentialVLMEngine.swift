@@ -546,32 +546,24 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         CLILogger.log("  - scatter merge: \(imagePositions.count) image positions, hidden_dim=\(hiddenDim)")
 
         // Create a copy of the text embeddings as our merge target.
-        // We read from both text and image, then write merged into the text array.
-        // Since NDArray is value-type, we can work with a copy.
         var merged = textEmbeddings
 
         guard !imagePositions.isEmpty else { return merged }
 
-        let bytesPerElement: Int
-        switch scalarType {
-        case .float16, .bfloat16: bytesPerElement = 2
-        case .float32: bytesPerElement = 4
-        default: bytesPerElement = 2  // fallback
-        }
-        let bytesPerVector = hiddenDim * bytesPerElement
         let imageTokenCount = config.visionConfig.imageTokenCount
 
         // Perform the scatter: copy image embedding vectors into placeholder positions
-        imageEmbeddings.view(as: UInt8.self).withUnsafePointer { imgPtr, _, _ in
-            var mutableView = merged.mutableView(as: UInt8.self)
+        // Use Float16 views since both tensors are float16.
+        imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
+            var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
                 for (i, pos) in imagePositions.enumerated() {
                     guard i < imageTokenCount else { break }
-                    let srcOffset = i * bytesPerVector
-                    let dstOffset = pos * bytesPerVector
+                    let srcOffset = i * hiddenDim
+                    let dstOffset = pos * hiddenDim
                     (mergedPtr + dstOffset).update(
                         from: imgPtr + srcOffset,
-                        count: bytesPerVector
+                        count: hiddenDim
                     )
                 }
             }
