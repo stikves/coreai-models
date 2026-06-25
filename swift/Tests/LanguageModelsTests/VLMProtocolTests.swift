@@ -6,10 +6,14 @@
 import Foundation
 import Testing
 
+#if canImport(CoreAI)
+import CoreAI
+#endif
 @testable import CoreAILanguageModels
 
 @Suite("Multimodal types")
 struct MultimodalTypeTests {
+    #if canImport(CoreAI)
     @Test("EmbeddedInput wraps NDArray with positions")
     func embeddedInputBasics() {
         let embeddings = NDArray(
@@ -23,6 +27,7 @@ struct MultimodalTypeTests {
         #expect(input.tokenCount == 256)
         #expect(input.imageTokenPositions.count == 256)
     }
+    #endif
 
     @Test("VisionConfig decodes from snake_case JSON")
     func visionConfigDecode() throws {

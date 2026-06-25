@@ -118,7 +118,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     private let valueCacheDescriptor: NDArrayDescriptor
 
     // Track processed tokens for incremental inference
-    private var processedTokenCount: Int = 0
+    public private(set) var processedTokenCount: Int = 0
 
     // MARK: - Image Preprocessor
 
@@ -778,15 +778,26 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     // MARK: - Lifecycle
 
     public func reset() async throws {
-        _activeToken.withLock {
-            $0?.cancel()
-            $0 = nil
+        try await reset(to: 0)
+    }
+
+    public func reset(to tokenIndex: Int) async throws {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "reset(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]")
+        if tokenIndex == 0 {
+            _activeToken.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIVLM")
+            processedTokenCount = 0
+            zeroFill(&keyCache)
+            zeroFill(&valueCache)
+            resetSpan.end()
+        } else {
+            processedTokenCount = tokenIndex
         }
-        let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIVLM")
-        processedTokenCount = 0
-        zeroFill(&keyCache)
-        zeroFill(&valueCache)
-        resetSpan.end()
     }
 
     public func cancel() async throws {

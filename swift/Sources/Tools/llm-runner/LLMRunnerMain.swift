@@ -176,6 +176,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var chunkSize: Int?
 
+    @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
+    var imagePath: String?
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -442,6 +445,62 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("   Max generation tokens: \(maxTokens)", component: "Main")
         CLILogger.log("   Required context length: \(requiredContextLength)", component: "Main")
         // Engines will validate context length during inference
+
+        // VLM path: if --image is provided and engine supports multimodal
+        if let imagePath = imagePath {
+            guard let vlmEngine = inferenceEngine as? any MultimodalInferenceEngine else {
+                print("Error: --image requires a vision-language model (engine does not support multimodal)")
+                throw ExitCode.failure
+            }
+
+            let imageURL = URL(fileURLWithPath: imagePath)
+            guard FileManager.default.fileExists(atPath: imageURL.path) else {
+                print("Error: image not found at \(imagePath)")
+                throw ExitCode.failure
+            }
+
+            if !CLILogger.isVerbose {
+                print("Generating...")
+            }
+
+            CLILogger.log("Encoding image: \(imagePath)", component: "VLM")
+            let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
+            CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
+
+            let eosTokenIds: Set<Int32> = {
+                var ids = Set<Int32>()
+                if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
+                ids.formUnion(additionalEosTokenIds)
+                return ids
+            }()
+
+            let inferenceID = InstrumentsProfiler.beginInference(
+                promptTokens: actualInputTokens + embeddedInput.tokenCount, maxTokens: maxTokens)
+
+            let tokenStream = try vlmEngine.generate(
+                with: embeddedInput,
+                tokens: promptTokens.map { Int32($0) },
+                samplingConfiguration: samplingConfiguration,
+                inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+            )
+
+            var generatedText = ""
+            for try await output in tokenStream {
+                let token = output.tokenId
+                if eosTokenIds.contains(token) { break }
+                let piece = tokenizer.decode(tokens: [Int(token)])
+                generatedText += piece
+                print(piece, terminator: "")
+                fflush(stdout)
+            }
+            print()
+
+            InstrumentsProfiler.endInference(
+                generatedTokens: tokenizer.encode(text: generatedText).count, signpostID: inferenceID)
+            await PerformanceMetrics.shared.endOverallTiming()
+            await PerformanceMetrics.shared.printSummary(verbose: CLILogger.isVerbose)
+            return
+        }
 
         // Build text generator with preloaded inference engine
         CLILogger.log("Building text generator...", component: "Main")
