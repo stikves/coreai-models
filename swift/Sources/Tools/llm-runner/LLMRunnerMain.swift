@@ -503,6 +503,17 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             let embeddedInput = try await vlmEngine.encodeImage(at: imageURL)
             CLILogger.log("Image encoded: \(embeddedInput.tokenCount) visual tokens", component: "VLM")
 
+            // Build VLM prompt with image placeholder tokens:
+            // "USER: " + (<image> × imageTokenCount) + "\n" + prompt + "\nASSISTANT:"
+            let imageTokenCount = embeddedInput.tokenCount
+            let imageTokenId = bundle.visionConfig!.imageTokenId
+            var vlmTokens = tokenizer.encode(text: "USER: ").map { Int32($0) }
+            vlmTokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+            let suffix = "\n" + displayPrompt + "\nASSISTANT:"
+            vlmTokens.append(contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
+
+            CLILogger.log("VLM prompt: \(vlmTokens.count) tokens (\(imageTokenCount) image placeholders)", component: "VLM")
+
             let eosTokenIds: Set<Int32> = {
                 var ids = Set<Int32>()
                 if let eos = tokenizer.eosTokenId { ids.insert(Int32(eos)) }
@@ -511,11 +522,11 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             }()
 
             let inferenceID = InstrumentsProfiler.beginInference(
-                promptTokens: actualInputTokens + embeddedInput.tokenCount, maxTokens: maxTokens)
+                promptTokens: vlmTokens.count, maxTokens: maxTokens)
 
             let tokenStream = try vlmEngine.generate(
                 with: embeddedInput,
-                tokens: promptTokens.map { Int32($0) },
+                tokens: vlmTokens,
                 samplingConfiguration: samplingConfiguration,
                 inferenceOptions: InferenceOptions(maxTokens: maxTokens)
             )
