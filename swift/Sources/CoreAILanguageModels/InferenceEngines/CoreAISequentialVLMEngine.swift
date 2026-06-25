@@ -84,6 +84,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     private let visionFunctionDescriptor: InferenceFunctionDescriptor
     private let projectFunction: InferenceFunction
     private let projectFunctionDescriptor: InferenceFunctionDescriptor
+    private let visionProjectorFused: Bool
 
     // MARK: - Embed Model Handle
 
@@ -158,26 +159,46 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         )
 
         // --- Vision pipeline ---
+        // Vision model may have separate "encode_image"+"project" functions (internal export)
+        // or a single fused "main" function (public export). Support both.
 
-        guard let visionDesc = visionModel.model.functionDescriptor(for: "encode_image") else {
-            throw InferenceRuntimeError.functionNotFound("encode_image")
-        }
-        self.visionFunctionDescriptor = visionDesc
+        let hasSeparateVision = visionModel.model.functionDescriptor(for: "encode_image") != nil
+        self.visionProjectorFused = !hasSeparateVision
+        if hasSeparateVision {
+            guard let visionDesc = visionModel.model.functionDescriptor(for: "encode_image") else {
+                throw InferenceRuntimeError.functionNotFound("encode_image")
+            }
+            self.visionFunctionDescriptor = visionDesc
 
-        guard let visionFn = try visionModel.model.loadFunction(named: "encode_image") else {
-            throw InferenceRuntimeError.functionNotFound("encode_image")
-        }
-        self.visionFunction = visionFn
+            guard let visionFn = try visionModel.model.loadFunction(named: "encode_image") else {
+                throw InferenceRuntimeError.functionNotFound("encode_image")
+            }
+            self.visionFunction = visionFn
 
-        guard let projectDesc = visionModel.model.functionDescriptor(for: "project") else {
-            throw InferenceRuntimeError.functionNotFound("project")
-        }
-        self.projectFunctionDescriptor = projectDesc
+            guard let projectDesc = visionModel.model.functionDescriptor(for: "project") else {
+                throw InferenceRuntimeError.functionNotFound("project")
+            }
+            self.projectFunctionDescriptor = projectDesc
 
-        guard let projectFn = try visionModel.model.loadFunction(named: "project") else {
-            throw InferenceRuntimeError.functionNotFound("project")
+            guard let projectFn = try visionModel.model.loadFunction(named: "project") else {
+                throw InferenceRuntimeError.functionNotFound("project")
+            }
+            self.projectFunction = projectFn
+        } else {
+            // Fused vision+projector as single "main" function
+            guard let visionDesc = visionModel.model.functionDescriptor(for: "main") else {
+                throw InferenceRuntimeError.functionNotFound(
+                    "Vision model needs 'encode_image' or 'main' function")
+            }
+            self.visionFunctionDescriptor = visionDesc
+            self.projectFunctionDescriptor = visionDesc
+
+            guard let visionFn = try visionModel.model.loadFunction(named: "main") else {
+                throw InferenceRuntimeError.functionNotFound("main (vision)")
+            }
+            self.visionFunction = visionFn
+            self.projectFunction = visionFn
         }
-        self.projectFunction = projectFn
 
         // --- Embed pipeline ---
 
@@ -344,8 +365,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         // Step 2: Run encode_image
         let encoderOutput = try await runVisionEncoder(pixels: chwPixels)
 
-        // Step 3: Run project
-        let projectedEmbeddings = try await runProjector(encoderOutput: encoderOutput)
+        // Step 3: Run projector (skip if fused with encoder)
+        let projectedEmbeddings = visionProjectorFused ? encoderOutput : try await runProjector(encoderOutput: encoderOutput)
 
         InstrumentsProfiler.endCustomInterval(
             name: "CoreAIVLM EncodeImage",

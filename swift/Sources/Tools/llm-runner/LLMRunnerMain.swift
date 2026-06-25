@@ -338,33 +338,69 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Create inference engine
         CLILogger.log("Creating inference engine...", component: "Main")
 
-        let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
         let engineOptions = EngineOptions(
             variant: inferenceEngineVariant,
             kvCacheStrategy: kvCacheStrategy,
             kvCacheSize: kvCacheInitialCapacity
         )
-        let engineConfig = ModelConfig(
-            name: bundle.name,
-            tokenizer: bundle.tokenizer,
-            vocabSize: bundle.vocabSize,
-            maxContextLength: bundle.maxContextLength,
-            serializedModel: [bundle.modelAssetPath],
-            function: bundle.language.functionMap?.name(for: "main") ?? "main"
-        )
-        let configData = try JSONEncoder().encode(engineConfig)
 
         // Parallel loading: engine compilation + tokenizer are independent.
         let modelLoadSpan = InstrumentsProfiler.beginModelLoad(name: bundle.name)
         let tokenizerLoadSpan = InstrumentsProfiler.beginTokenizerLoad(id: modelFile)
-        async let engineResult = EngineFactory.createEngine(
-            config: configData,
-            modelURL: modelURL,
-            options: engineOptions
-        )
         async let tokenizerResult = bundle.loadTokenizer()
 
-        let inferenceEngine = try await engineResult
+        let inferenceEngine: any InferenceEngine
+        if bundle.bundle.kind == .vlm {
+            // VLM: load 3 models and create VLM engine directly
+            let visionURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.vision)
+            let embedURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.embedding)
+            let mainURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+
+            guard let visionConfig = bundle.visionConfig else {
+                throw InferenceRuntimeError.invalidArgument(
+                    "VLM bundle missing 'vision' config in metadata.json")
+            }
+
+            let baseConfig = ModelConfig(
+                name: bundle.name,
+                tokenizer: bundle.tokenizer,
+                vocabSize: bundle.vocabSize,
+                maxContextLength: bundle.maxContextLength,
+                serializedModel: [mainURL.path],
+                function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            )
+            let vlmConfig = VLMModelConfig(base: baseConfig, visionConfig: visionConfig)
+
+            let visionModel = try await PreparedModel.prepare(at: visionURL)
+            let embedModel = try await PreparedModel.prepare(at: embedURL)
+            let llmModel = try await PreparedModel.prepare(at: mainURL)
+
+            inferenceEngine = try await CoreAISequentialVLMEngine(
+                config: vlmConfig,
+                visionModel: visionModel,
+                embedModel: embedModel,
+                llmModel: llmModel,
+                options: engineOptions
+            )
+        } else {
+            // Standard LLM: use EngineFactory
+            let modelURL = try bundle.requireModelURL(for: ModelBundle.ComponentKey.main)
+            let engineConfig = ModelConfig(
+                name: bundle.name,
+                tokenizer: bundle.tokenizer,
+                vocabSize: bundle.vocabSize,
+                maxContextLength: bundle.maxContextLength,
+                serializedModel: [bundle.modelAssetPath],
+                function: bundle.language.functionMap?.name(for: "main") ?? "main"
+            )
+            let configData = try JSONEncoder().encode(engineConfig)
+            inferenceEngine = try await EngineFactory.createEngine(
+                config: configData,
+                modelURL: modelURL,
+                options: engineOptions
+            )
+        }
+
         modelLoadSpan.end()
         let tokenizer = try await tokenizerResult
         tokenizerLoadSpan.end()
