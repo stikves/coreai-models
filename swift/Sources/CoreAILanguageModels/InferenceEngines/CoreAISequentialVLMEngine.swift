@@ -569,13 +569,13 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "scatterMerge: image position \(imagePositions.last ?? -1) exceeds sequence length \(seqLen)")
         }
 
-        // Copy image embeddings into placeholder positions.
+        // Copy image embeddings into placeholder positions (f16 or bf16 — both 2 bytes).
         precondition(
-            imageEmbeddings.scalarType == .float16,
-            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)"
+            imageEmbeddings.scalarType == .float16 || imageEmbeddings.scalarType == .bfloat16,
+            "scatterMerge requires float16 or bfloat16 embeddings; got \(imageEmbeddings.scalarType)"
         )
-        imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
-            var mutableView = merged.mutableView(as: Float16.self)
+        imageEmbeddings.view(as: UInt16.self).withUnsafePointer { imgPtr, _, _ in
+            var mutableView = merged.mutableView(as: UInt16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
                 for (i, pos) in imagePositions.enumerated() {
                     let srcOffset = i * hiddenDim
@@ -824,8 +824,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             }
             let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIVLM")
             processedTokenCount = 0
-            zeroFill(&keyCache)
-            zeroFill(&valueCache)
+            // Reallocate caches (IOSurface is zero-initialized on allocation)
+            keyCache = NDArray(descriptor: keyCacheDescriptor.resolvingDynamicDimensions(
+                keyCacheDescriptor.shape.map { $0 < 0 ? currentKVCapacity : $0 }))
+            valueCache = NDArray(descriptor: valueCacheDescriptor.resolvingDynamicDimensions(
+                valueCacheDescriptor.shape.map { $0 < 0 ? currentKVCapacity : $0 }))
             resetSpan.end()
         } else {
             processedTokenCount = tokenIndex
@@ -849,10 +852,12 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         // Warmup the decode path with a single dummy token through embed + LLM
         let dummyTokens: ArraySlice<Int32> = [Int32(1)][...]
         _ = try await processTokenBatch(dummyTokens)
-        // Reset state after warmup
+        // Reset state after warmup — reallocate caches (IOSurface is zero-initialized)
         processedTokenCount = 0
-        zeroFill(&keyCache)
-        zeroFill(&valueCache)
+        keyCache = NDArray(descriptor: keyCacheDescriptor.resolvingDynamicDimensions(
+            keyCacheDescriptor.shape.map { $0 < 0 ? currentKVCapacity : $0 }))
+        valueCache = NDArray(descriptor: valueCacheDescriptor.resolvingDynamicDimensions(
+            valueCacheDescriptor.shape.map { $0 < 0 ? currentKVCapacity : $0 }))
     }
 
     // MARK: - KV Cache (dynamic growth)
@@ -919,10 +924,15 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
 
     private func zeroFill(_ array: inout NDArray) {
         let count = array.shape.reduce(1, *)
-        var view = array.mutableView(as: LogitsScalarType.self)
-        view.withUnsafeMutablePointer { ptr, _, _ in
-            for i in 0..<count {
-                ptr[i] = 0
+        if array.scalarType == .bfloat16 {
+            var view = array.mutableView(as: UInt16.self)
+            view.withUnsafeMutablePointer { ptr, _, _ in
+                for i in 0..<count { ptr[i] = 0 }
+            }
+        } else {
+            var view = array.mutableView(as: LogitsScalarType.self)
+            view.withUnsafeMutablePointer { ptr, _, _ in
+                for i in 0..<count { ptr[i] = 0 }
             }
         }
     }

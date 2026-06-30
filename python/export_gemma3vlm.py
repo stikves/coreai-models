@@ -149,7 +149,7 @@ class Gemma3VisionEncoder(nn.Module):
         # Linear projection: [1, 256, 1152] @ [1152, 2560] -> [1, 256, 2560]
         x = torch.matmul(x, self.proj_linear_weight)
 
-        return x.to(torch.float16)
+        return x.to(torch.bfloat16)
 
 
 class VisionEncoderLayer(nn.Module):
@@ -245,7 +245,7 @@ class EmbedModel(nn.Module):
         embeddings = self.embed_tokens(input_ids)
         return (embeddings * torch.tensor(
             self.embed_scale, dtype=embeddings.dtype, device=embeddings.device
-        )).to(torch.float16)
+        )).to(torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ def export_vision(
     key_to_file: dict[str, str],
     output_path: Path,
     num_vision_layers: int | None = None,
-    target_dtype: torch.dtype = torch.float16,
+    target_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
     """Export the vision encoder + projector as vision.aimodel."""
     from coreai_models.export.macos import export_to_coreai
@@ -427,7 +427,7 @@ def export_vision(
 def export_embed(
     key_to_file: dict[str, str],
     output_path: Path,
-    target_dtype: torch.dtype = torch.float16,
+    target_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
     """Export the token embedding lookup (with embed_scale) as embed.aimodel."""
     from coreai_models.export.macos import export_to_coreai
@@ -467,7 +467,7 @@ def export_text_decoder(
     key_to_file: dict[str, str],
     output_path: Path,
     text_config,
-    target_dtype: torch.dtype = torch.float16,
+    target_dtype: torch.dtype = torch.bfloat16,
     num_layers: int | None = None,
     max_context_length: int = 131072,
 ) -> None:
@@ -733,7 +733,7 @@ def main() -> None:
     hf_config = AutoConfig.from_pretrained(model_dir)
     text_config = hf_config.text_config
 
-    target_dtype = torch.float16
+    target_dtype = torch.bfloat16
 
     # When --num-layers is set for smoke testing, also limit vision layers
     # unless --num-vision-layers is explicitly provided
