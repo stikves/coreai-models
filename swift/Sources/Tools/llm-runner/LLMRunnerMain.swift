@@ -179,6 +179,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("image"), help: "Path to an image file for vision-language models")
     var imagePath: String?
 
+    @Option(name: .customLong("image-max-tiles"), help: "Maximum tiles for image splitting (overrides model config). 1 = single crop, no tiling.")
+    var imageMaxTiles: Int?
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 

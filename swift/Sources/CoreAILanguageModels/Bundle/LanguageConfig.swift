@@ -148,13 +148,13 @@ public struct LanguageConfig: Codable, Sendable, Equatable {
 /// Vision-specific configuration for VLM bundles.
 /// Nil for text-only language models.
 public struct VisionConfig: Codable, Sendable, Equatable {
-    /// Input image size (square). Vision encoder expects this resolution.
+    /// Input image size (square). Vision encoder expects this resolution per tile.
     public let imageSize: Int
 
     /// Patch size for the vision transformer.
     public let patchSize: Int
 
-    /// Number of embedding tokens produced per image after projection.
+    /// Number of embedding tokens produced per tile after projection.
     public let imageTokenCount: Int
 
     /// Token ID used as a placeholder in the text sequence for image positions.
@@ -169,6 +169,13 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// Pixel rescale factor applied before normalization. Defaults to 1.0 when omitted.
     public let rescaleFactor: Double
 
+    /// Maximum number of tiles to split an image into. 1 = single crop (no tiling).
+    /// The engine runs the vision encoder once per tile and concatenates features.
+    public let maxTiles: Int
+
+    /// Whether to include a downscaled thumbnail as an additional tile.
+    public let includeThumbnail: Bool
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -180,7 +187,9 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         imageTokenId: Int32,
         imageMean: [Double]? = nil,
         imageStd: [Double]? = nil,
-        rescaleFactor: Double? = nil
+        rescaleFactor: Double? = nil,
+        maxTiles: Int? = nil,
+        includeThumbnail: Bool? = nil
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -189,6 +198,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.imageMean = imageMean ?? Self.clipMean
         self.imageStd = imageStd ?? Self.clipStd
         self.rescaleFactor = rescaleFactor ?? 1.0
+        self.maxTiles = maxTiles ?? 1
+        self.includeThumbnail = includeThumbnail ?? false
     }
 
     enum CodingKeys: String, CodingKey {
@@ -199,6 +210,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case imageMean = "image_mean"
         case imageStd = "image_std"
         case rescaleFactor = "rescale_factor"
+        case maxTiles = "max_tiles"
+        case includeThumbnail = "include_thumbnail"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -210,5 +223,7 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.imageMean = try c.decodeIfPresent([Double].self, forKey: .imageMean) ?? Self.clipMean
         self.imageStd = try c.decodeIfPresent([Double].self, forKey: .imageStd) ?? Self.clipStd
         self.rescaleFactor = try c.decodeIfPresent(Double.self, forKey: .rescaleFactor) ?? 1.0
+        self.maxTiles = try c.decodeIfPresent(Int.self, forKey: .maxTiles) ?? 1
+        self.includeThumbnail = try c.decodeIfPresent(Bool.self, forKey: .includeThumbnail) ?? false
     }
 }
