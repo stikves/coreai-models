@@ -569,13 +569,14 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                 "scatterMerge: image position \(imagePositions.last ?? -1) exceeds sequence length \(seqLen)")
         }
 
-        // Copy image embeddings into placeholder positions (f16 or bf16 — both 2 bytes).
+        // Copy image embeddings into placeholder positions.
         precondition(
-            imageEmbeddings.scalarType == .float16 || imageEmbeddings.scalarType == .bfloat16,
-            "scatterMerge requires float16 or bfloat16 embeddings; got \(imageEmbeddings.scalarType)"
+            imageEmbeddings.scalarType == .float16,
+            "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType). "
+            + "BFloat16 models need a pipelined VLM engine variant."
         )
-        imageEmbeddings.view(as: UInt16.self).withUnsafePointer { imgPtr, _, _ in
-            var mutableView = merged.mutableView(as: UInt16.self)
+        imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
+            var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
                 for (i, pos) in imagePositions.enumerated() {
                     let srcOffset = i * hiddenDim
