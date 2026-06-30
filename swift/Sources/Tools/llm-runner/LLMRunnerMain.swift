@@ -890,15 +890,35 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             with: embeddedInput,
             tokens: vlmTokens,
             samplingConfiguration: samplingConfiguration,
-            inferenceOptions: InferenceOptions(maxTokens: maxTokens)
+            inferenceOptions: InferenceOptions(
+                maxTokens: maxTokens,
+                includeLogits: printLogits || saveLogits != nil
+            )
         )
+
+        CLILogger.log("VLM generate started, maxTokens=\(maxTokens)", component: "VLM")
 
         var generatedTokens: [Int] = []
         var previousText = ""
         for try await output in tokenStream {
             let token = output.tokenId
+            if printLogits {
+                print("\n  raw token=\(token)", terminator: "")
+            }
             if eosTokenIds.contains(token) { break }
             generatedTokens.append(Int(token))
+
+            if printLogits {
+                if let logits = output.logits {
+                    let indexed = logits.enumerated().map { (idx: $0.offset, val: Float($0.element)) }
+                    let topK = indexed.sorted { $0.val > $1.val }.prefix(5)
+                    let desc = topK.map { "[\($0.idx)]=\(String(format: "%.3f", $0.val))" }.joined(separator: " ")
+                    print("\n  logits top5: \(desc)", terminator: "")
+                } else {
+                    print("\n  token=\(token) (logits=nil)", terminator: "")
+                }
+            }
+
             let fullText = tokenizer.decode(tokens: generatedTokens)
             let delta = String(fullText.dropFirst(previousText.count))
             previousText = fullText
