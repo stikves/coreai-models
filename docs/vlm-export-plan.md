@@ -172,14 +172,111 @@ remove sliding window, accept inputs_embeds instead of input_ids.
 
 ## 2. Gemma3 4B Multimodal (Gemma TOS — custom license)
 
-*Research pending — next in queue.*
+### Model ID
+- `google/gemma-3-4b-it` (already cached locally)
 
-Key facts known:
-- SigLIP vision encoder (224x224)
-- Simplest projection: AvgPool + RMSNorm + Linear
-- Text decoder already in registry (gemma3_text)
-- Pan-and-Scan multi-crop (skip for v1, use single 224x224)
-- Normalization: [0.5, 0.5, 0.5] / [0.5, 0.5, 0.5]
+### Architecture Overview
+
+```
+Image → SigLIP ViT (896x896, 27 layers) → AvgPool(4x4) → RMSNorm → Linear → scatter → Gemma3Decoder → logits
+```
+
+### Confirmed Config (from cached model)
+
+```
+Vision (SigLIP):
+  hidden_size: 1152
+  num_hidden_layers: 27
+  num_attention_heads: 16
+  image_size: 896
+  patch_size: 14
+  intermediate_size: 4304
+  model_type: siglip_vision_model
+  patches_per_image: 64 (896/14)
+  total_patches: 4096 (64x64)
+
+Projector (Gemma3MultiModalProjector):
+  - AvgPool2d(kernel_size=4, stride=4): 64x64 → 16x16 = 256 tokens
+  - RMSNorm(1152)
+  - matmul with mm_input_projection_weight [1152, 2560] (no bias)
+  Output: [1, 256, 2560]
+
+Text (Gemma3TextConfig):
+  hidden_size: 2560
+  num_hidden_layers: 34
+  num_attention_heads: 8 (default)
+  num_key_value_heads: 4 (default)
+  head_dim: 256
+  intermediate_size: 10240
+  vocab_size: 262208
+  rope_theta: 1000000.0
+  max_position_embeddings: 131072
+  sliding_window: 1024
+  rope_scaling: {factor: 8.0, rope_type: "linear"}
+
+Top-level:
+  image_token_index: 262144
+  mm_tokens_per_image: 256
+```
+
+### Weight Prefixes (from safetensors index)
+- `vision_tower.vision_model.embeddings.*`
+- `vision_tower.vision_model.encoder.layers.N.*`
+- `multi_modal_projector.mm_input_projection_weight` — shape [1152, 2560]
+- `multi_modal_projector.mm_soft_emb_norm.weight` — shape [1152]
+- `language_model.model.embed_tokens.weight`
+- `language_model.model.layers.N.*`
+- `language_model.model.norm.weight`
+- (no separate lm_head — tie_word_embeddings=True implied)
+
+### Image Preprocessing
+- **Normalization**: IMAGENET_STANDARD (mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+- **rescale_factor**: 1/255
+- **Resize**: 896x896 fixed (with Pan-and-Scan for large images — skip for v1)
+- **Resampling**: BICUBIC
+
+### Key Differences from SmolVLM2
+- **Much larger vision encoder**: 27 layers vs 12, 4096 patches vs 1024
+- **Different spatial reduction**: AvgPool2d(4x4) vs pixel_shuffle(4x)
+- **Larger text decoder**: 2560 hidden, 34 layers, head_dim=256
+- **Sliding window attention**: alternating global/local layers in text decoder
+- **Text decoder already exists**: `gemma3_text` in registry (but needs inputs_embeds variant)
+- **Same normalization**: IMAGENET_STANDARD [0.5, 0.5, 0.5]
+
+### Implementation Plan
+
+1. **Text decoder (inputs_embeds)**: Subclass existing `Gemma3ForCausalLM` or create
+   `Gemma3VLMForCausalLM` that takes inputs_embeds. The existing model handles
+   sliding window + RoPE scaling already.
+
+2. **Vision encoder**: Export SigLIP ViT (27 layers, 896x896 fixed input).
+   Large model (~400M vision params) — export may take a while.
+
+3. **Projector**: Fuse AvgPool + RMSNorm + matmul into vision export or keep separate.
+   Keeping it fused with vision is simpler (one less function to manage).
+
+4. **Bundle metadata**:
+```json
+{
+  "kind": "vlm",
+  "vision": {
+    "image_size": 896,
+    "patch_size": 14,
+    "image_token_count": 256,
+    "image_token_id": 262144,
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "rescale_factor": 1.0
+  }
+}
+```
+
+### Risks
+- 4B model is large — export + compilation will be slow
+- Sliding window attention in text decoder needs testing with VLM prefill
+- 896x896 vision input is 4x the pixels of SmolVLM (512x512) — memory concerns
+- rope_scaling with linear factor=8 — verify our existing gemma3 impl handles it
+- License is Gemma TOS (not standard OSS) — may limit public release
 
 ---
 
