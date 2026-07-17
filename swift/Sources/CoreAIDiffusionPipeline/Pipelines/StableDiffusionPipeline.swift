@@ -114,6 +114,15 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
         let batchedEmbeddings = negativeEmbeddings + textEmbeddings  // [2, 77, dim]
         let batchedEmbShape = [2, 77, textEmbeddings.count / 77]
 
+        defer {
+            if configuration.lazyModelLoading {
+                Task {
+                    await components.denoiser.function.unloadResources()
+                    await components.decoder.function.unloadResources()
+                }
+            }
+        }
+
         for (step, timeStep) in schedule.timeSteps.enumerated() {
             let progress = PipelineProgress(step: step, totalSteps: schedule.timeSteps.count, currentLatent: nil)
             if !progressHandler(progress) { break }
@@ -141,10 +150,6 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
             latents = schedule.step(guided, timeStep, latents)
         }
 
-        if configuration.lazyModelLoading {
-            await components.denoiser.function.unloadResources()
-        }
-
         // 5. Decode latents → pixels → CGImage
         var scaledLatents = [Float](repeating: 0, count: latentCount)
         let invScale = 1.0 / scaleFactor
@@ -154,9 +159,6 @@ public struct StableDiffusionPipeline: DiffusionPipeline {
 
         let pixels = try await components.decoder.function.run(
             floatInputs: [(scaledLatents, latentShape)])
-        if configuration.lazyModelLoading {
-            await components.decoder.function.unloadResources()
-        }
         let image = try DiffusionUtilities.pixelsToCGImage(pixels, height: size.height, width: size.width)
 
         // Wrap latents back to NDArray for GenerationResult

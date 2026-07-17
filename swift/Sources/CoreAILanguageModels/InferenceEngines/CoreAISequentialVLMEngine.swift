@@ -579,6 +579,13 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
             throw InferenceRuntimeError.invalidInputType(
                 "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
         }
+        let requiredElements = imageTokenCount * hiddenDim
+        let availableElements = imageEmbeddings.shape.reduce(1, *)
+        guard availableElements >= requiredElements else {
+            throw InferenceRuntimeError.invalidArgument(
+                "scatterMerge: image embeddings have \(availableElements) elements, "
+                    + "need at least \(requiredElements) (\(imageTokenCount) tokens × \(hiddenDim) hidden)")
+        }
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             var mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in
@@ -775,6 +782,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
@@ -800,6 +811,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
+        _activeToken.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         let token = GenerationToken()
         _activeToken.withLock { $0 = token }
         return GenerationSequence(
