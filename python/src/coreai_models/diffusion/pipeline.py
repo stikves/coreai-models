@@ -396,8 +396,12 @@ def _build_ltx_video_config(hf_pipe: Any, model_id: str) -> dict:
     transformer_config = hf_pipe.transformer.config
 
     scaling_factor = getattr(vae_config, "scaling_factor", 1.0)
-    spatial_compression = getattr(vae_config, "spatial_compression_ratio", 32)
-    temporal_compression = getattr(vae_config, "temporal_compression_ratio", 8)
+    spatial_compression = getattr(
+        vae_config, "spatial_compression_ratio",
+        getattr(vae_config, "base_image_resolution_scale", 32))
+    temporal_compression = getattr(
+        vae_config, "temporal_compression_ratio",
+        getattr(vae_config, "base_temporal_resolution_scale", 8))
     latent_channels = getattr(vae_config, "latent_channels", 128)
 
     num_attention_heads = getattr(transformer_config, "num_attention_heads", 32)
