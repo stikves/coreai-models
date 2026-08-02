@@ -133,6 +133,8 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
+    elif pipeline_type == "ltx_video":
+        _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
     else:
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
@@ -163,6 +165,13 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         # Text encoder needs float32 for token embedding precision
+        hf_pipe.text_encoder = hf_pipe.text_encoder.float()
+        return hf_pipe
+
+    if pipeline_type == "ltx_video":
+        from diffusers import LTXPipeline
+
+        hf_pipe = LTXPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         hf_pipe.text_encoder = hf_pipe.text_encoder.float()
         return hf_pipe
 
@@ -317,6 +326,8 @@ def _write_metadata_json(
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "ltx_video":
+        diffusion_config = _build_ltx_video_config(hf_pipe, model_id)
     else:
         diffusion_config = _build_sd_config(hf_pipe, model_id, pipeline_type)
 
@@ -377,6 +388,39 @@ def _build_flux2_config(hf_pipe: Any, model_id: str) -> dict:
         "default_steps": 4,
         "rope_axes_dims": axes_dims_rope,
         "rope_theta": rope_theta,
+    }
+
+
+def _build_ltx_video_config(hf_pipe: Any, model_id: str) -> dict:
+    vae_config = hf_pipe.vae.config
+    transformer_config = hf_pipe.transformer.config
+
+    scaling_factor = getattr(vae_config, "scaling_factor", 1.0)
+    spatial_compression = getattr(vae_config, "spatial_compression_ratio", 32)
+    temporal_compression = getattr(vae_config, "temporal_compression_ratio", 8)
+    latent_channels = getattr(vae_config, "latent_channels", 128)
+
+    num_attention_heads = getattr(transformer_config, "num_attention_heads", 32)
+    attention_head_dim = getattr(transformer_config, "attention_head_dim", 64)
+    caption_channels = getattr(transformer_config, "caption_channels", 4096)
+    rope_theta = getattr(transformer_config, "rope_theta", 10000.0)
+
+    return {
+        "type": "ltx-video",
+        "prediction_type": "flow_matching",
+        "encoder_scale_factor": scaling_factor,
+        "decoder_scale_factor": scaling_factor,
+        "spatial_compression_ratio": spatial_compression,
+        "temporal_compression_ratio": temporal_compression,
+        "latent_channels": latent_channels,
+        "num_attention_heads": num_attention_heads,
+        "attention_head_dim": attention_head_dim,
+        "caption_channels": caption_channels,
+        "rope_theta": rope_theta,
+        "default_guidance_scale": 3.0,
+        "default_steps": 50,
+        "default_num_frames": 49,
+        "default_fps": 24,
     }
 
 
