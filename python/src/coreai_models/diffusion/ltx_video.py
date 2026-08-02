@@ -286,8 +286,8 @@ def _dummy_ltx_video_transformer_impl(
 
 
 def dummy_ltx_video_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
-    """Default resolution: 9 latent frames, 64x64 spatial (512x320 output approx)."""
-    return _dummy_ltx_video_transformer_impl(pipe, num_frames=9, height=40, width=64)
+    """Default: 25 frames at 512x320. Latent: 4 frames x 10h x 16w = 640 seq_len."""
+    return _dummy_ltx_video_transformer_impl(pipe, num_frames=4, height=10, width=16)
 
 
 def dummy_ltx_video_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
@@ -301,11 +301,11 @@ def dummy_ltx_video_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
 def dummy_ltx_video_vae_decoder(pipe: Any) -> tuple[torch.Tensor, ...]:
     latent_channels = pipe.vae.config.latent_channels
     dtype = next(pipe.vae.parameters()).dtype
-    # 3D VAE: [B, C, T, H, W]
-    return (torch.randn(1, latent_channels, 9, 40, 64, dtype=dtype),)
+    # 3D VAE: [B, C, T, H, W] — matches transformer dummy (4 latent frames, 10x16 spatial)
+    return (torch.randn(1, latent_channels, 4, 10, 16, dtype=dtype),)
 
 
 def dummy_ltx_video_vae_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
     dtype = next(pipe.vae.parameters()).dtype
-    # Pixel space video: [B, C, T, H, W]
-    return (torch.randn(1, 3, 49, 320, 512, dtype=dtype),)
+    # Pixel space video: [B, C, T, H, W] — 25 frames at 320x512
+    return (torch.randn(1, 3, 25, 320, 512, dtype=dtype),)

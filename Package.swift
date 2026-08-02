@@ -127,6 +127,7 @@ let package = Package(
             dependencies: [
                 "CoreAIDiffusionPipeline",
                 "CoreAIShared",
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "swift/Sources/CoreAIVideoPipeline",
             swiftSettings: [
@@ -227,6 +228,18 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "swift/Sources/Tools/benchmark",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
+            name: "video-benchmark",
+            dependencies: [
+                "CoreAIVideoPipeline",
+                "CoreAIShared",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/video-benchmark",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]

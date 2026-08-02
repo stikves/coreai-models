@@ -134,7 +134,7 @@ async def _async_export_diffusion(config: DiffusionExportConfig) -> dict[str, st
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
     elif pipeline_type == "ltx_video":
-        _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
+        _save_tokenizer_pretrained(hf_pipe, output_path, overwrite=config.overwrite)
     else:
         _save_tokenizer(config.hf_model_id, output_path, hf_pipe, overwrite=config.overwrite)
 
@@ -261,6 +261,25 @@ def _save_flux2_sidecar_assets(hf_pipe: Any, output_path: Path, overwrite: bool)
         logger.info("Saved VAE batch norm stats")
     except Exception as e:
         logger.warning(f"Could not save VAE BN stats: {e}")
+
+
+def _save_tokenizer_pretrained(hf_pipe: Any, output_path: Path, overwrite: bool) -> None:
+    """Save tokenizer using save_pretrained, converting to fast tokenizer if needed."""
+    dst_dir = output_path / "tokenizer"
+    if dst_dir.exists() and not overwrite:
+        logger.info(f"Skipping tokenizer: {dst_dir} exists (use --overwrite)")
+        return
+    logger.info("Saving tokenizer...")
+    if dst_dir.exists():
+        shutil.rmtree(dst_dir)
+    tokenizer = hf_pipe.tokenizer
+    # T5 slow tokenizer doesn't produce tokenizer.json — convert to fast
+    if not hasattr(tokenizer, "vocab") and hasattr(tokenizer, "sp_model"):
+        from transformers import T5TokenizerFast
+
+        tokenizer = T5TokenizerFast.from_pretrained(tokenizer.name_or_path)
+    tokenizer.save_pretrained(str(dst_dir))
+    logger.info(f"Saved tokenizer to {dst_dir}")
 
 
 def _save_tokenizer(model_id: str, output_path: Path, hf_pipe: Any, overwrite: bool) -> None:

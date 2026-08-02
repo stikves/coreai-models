@@ -59,6 +59,13 @@ public actor CoreAIDiffusionModelFunction {
                 view.withUnsafeMutablePointer { ptr, _, _ in
                     for j in 0..<data.count { ptr[j] = Float16(data[j]) }
                 }
+            case .bfloat16:
+                array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
+                    let dst = ptr.assumingMemoryBound(to: UInt16.self)
+                    for j in 0..<data.count {
+                        dst[j] = UInt16(truncatingIfNeeded: data[j].bitPattern >> 16)
+                    }
+                }
             #endif
             case .float32:
                 var view = array.mutableView(as: Float.self)
@@ -166,6 +173,16 @@ public actor CoreAIDiffusionModelFunction {
                 result.reserveCapacity(count)
                 for i in 0..<count { result.append(Float(ptr[i])) }
             }
+        case .bfloat16:
+            array.rawView().withUnsafeBytes { ptr, shape, _ in
+                let count = (0..<shape.count).reduce(1) { $0 * shape[$1] }
+                result.reserveCapacity(count)
+                let src = ptr.assumingMemoryBound(to: UInt16.self)
+                for i in 0..<count {
+                    let bits = UInt32(src[i]) << 16
+                    result.append(Float(bitPattern: bits))
+                }
+            }
         #endif
         case .float32:
             array.view(as: Float.self).withUnsafePointer { ptr, shape, _ in
@@ -233,9 +250,9 @@ public enum CoreAIDiffusionError: Error, LocalizedError {
         case .notLoaded:
             return "Model not loaded. Call loadResources() first."
         case .unsupportedInputScalarType(let type):
-            return "Unsupported model input scalar type: \(type) (expected float16 or float32)"
+            return "Unsupported model input scalar type: \(type) (expected float16, bfloat16, or float32)"
         case .unsupportedOutputScalarType(let type):
-            return "Unsupported model output scalar type: \(type) (expected float16 or float32)"
+            return "Unsupported model output scalar type: \(type) (expected float16, bfloat16, or float32)"
         case .expectedSingleOutput(let names):
             return "Model declares \(names.count) outputs \(names); predict(...) expects exactly one. "
                 + "Use predictAllOutputs(inputs:) for multi-output models."

@@ -25,16 +25,16 @@ struct VideoRunner: AsyncParsableCommand {
     var numFrames: Int?
 
     @Option(help: "Output FPS")
-    var fps: Int = 24
+    var fps: Int?
 
     @Option(help: "Output resolution as WxH, e.g. 512x320")
     var resolution: String?
 
     @Option(help: "Number of denoising steps")
-    var steps: Int = 50
+    var steps: Int?
 
     @Option(name: .customLong("guidance-scale"), help: "Classifier-free guidance scale")
-    var guidanceScale: Float = 7.5
+    var guidanceScale: Float?
 
     @Option(help: "Random seed")
     var seed: UInt32 = 42
@@ -47,10 +47,31 @@ struct VideoRunner: AsyncParsableCommand {
         help: "Output format: mp4, gif, apng, webp, or frames")
     var outputFormat: String = "mp4"
 
+    @Flag(help: "Disable lazy model loading (keep all models in memory)")
+    var noLazyLoading: Bool = false
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
     func run() async throws {
+        let modelURL = URL(fileURLWithPath: model)
+
+        // Parse metadata to determine pipeline type
+        let metadataURL = modelURL.appendingPathComponent("metadata.json")
+        guard FileManager.default.fileExists(atPath: metadataURL.path) else {
+            print("Error: metadata.json not found in \(model)")
+            throw ExitCode.failure
+        }
+
+        let metadataData = try Data(contentsOf: metadataURL)
+        guard let json = try JSONSerialization.jsonObject(with: metadataData) as? [String: Any],
+            let diffusion = json["diffusion"] as? [String: Any],
+            let pipelineType = diffusion["type"] as? String
+        else {
+            print("Error: metadata.json missing 'diffusion.type'")
+            throw ExitCode.failure
+        }
+
         let parsedWidth: Int?
         let parsedHeight: Int?
         if let resolution {
@@ -69,19 +90,117 @@ struct VideoRunner: AsyncParsableCommand {
             parsedHeight = nil
         }
 
+        switch pipelineType {
+        case "ltx-video":
+            try await runLTXVideo(
+                modelURL: modelURL,
+                diffusion: diffusion,
+                parsedWidth: parsedWidth,
+                parsedHeight: parsedHeight
+            )
+        default:
+            print("Error: unsupported pipeline type '\(pipelineType)'")
+            throw ExitCode.failure
+        }
+    }
+
+    // MARK: - LTX Video
+
+    private func runLTXVideo(
+        modelURL: URL,
+        diffusion: [String: Any],
+        parsedWidth: Int?,
+        parsedHeight: Int?
+    ) async throws {
+        print("Loading LTX Video pipeline...")
+        let pipeline = try await LTXVideoPipeline(
+            from: modelURL,
+            lazyModelLoading: !noLazyLoading
+        )
+
+        let width = parsedWidth ?? pipeline.defaultVideoSize.width
+        let height = parsedHeight ?? pipeline.defaultVideoSize.height
+        let frameCount = numFrames ?? pipeline.defaultFrameCount
+        let outputFPS = fps ?? (diffusion["default_fps"] as? Int ?? 24)
+        let stepCount = steps ?? (diffusion["default_steps"] as? Int ?? 50)
+        let guidance =
+            guidanceScale
+            ?? (diffusion["default_guidance_scale"] as? NSNumber)?.floatValue ?? 3.0
+
+        let config = VideoConfiguration(
+            prompt: prompt,
+            seed: seed,
+            stepCount: stepCount,
+            guidanceScale: guidance,
+            numFrames: frameCount,
+            fps: outputFPS,
+            width: width,
+            height: height
+        )
+
         print("Video Generation Configuration")
         print("  Model:          \(model)")
+        print("  Pipeline:       LTX Video")
         print("  Prompt:         \(prompt)")
-        print("  Frames:         \(numFrames.map(String.init) ?? "model default")")
-        print("  FPS:            \(fps)")
-        print(
-            "  Resolution:     \(parsedWidth.map { "\($0)x\(parsedHeight!)" } ?? "model default")")
-        print("  Steps:          \(steps)")
-        print("  Guidance Scale: \(guidanceScale)")
+        print("  Frames:         \(frameCount)")
+        print("  FPS:            \(outputFPS)")
+        print("  Resolution:     \(width)x\(height)")
+        print("  Steps:          \(stepCount)")
+        print("  Guidance Scale: \(guidance)")
         print("  Seed:           \(seed)")
         print("  Output:         \(output)")
         print("  Format:         \(outputFormat)")
+        print("  Lazy Loading:   \(!noLazyLoading)")
         print()
-        print("Video pipeline not yet connected \u{2014} model loading coming soon")
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+
+        let result = try await pipeline.generateVideo(configuration: config) { progress in
+            switch progress.phase {
+            case .encoding:
+                print("Encoding text...")
+            case .denoising:
+                print("Denoising step \(progress.step)/\(progress.totalSteps)")
+            case .decoding:
+                print("Decoding video...")
+            case .assembling:
+                print("Assembling frames...")
+            }
+            return true
+        }
+
+        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+        print()
+        print("Generated \(result.frames.count) frames in \(String(format: "%.1f", elapsed))s")
+
+        // Write output
+        let outputURL = URL(fileURLWithPath: output)
+
+        switch outputFormat.lowercased() {
+        case "mp4":
+            try await VideoWriter.writeMP4(frames: result.frames, fps: result.fps, to: outputURL)
+            print("Saved MP4 to \(output)")
+
+        case "gif":
+            try VideoWriter.writeGIF(frames: result.frames, fps: result.fps, to: outputURL)
+            print("Saved GIF to \(output)")
+
+        case "apng":
+            try VideoWriter.writeAPNG(frames: result.frames, fps: result.fps, to: outputURL)
+            print("Saved APNG to \(output)")
+
+        case "webp":
+            try VideoWriter.writeWebP(frames: result.frames, fps: result.fps, to: outputURL)
+            print("Saved WebP to \(output)")
+
+        case "frames":
+            let dir = outputURL.deletingPathExtension()
+            try VideoWriter.writeFrames(frames: result.frames, to: dir)
+            print("Saved \(result.frames.count) frames to \(dir.path)")
+
+        default:
+            print("Error: unknown output format '\(outputFormat)'")
+            throw ExitCode.failure
+        }
     }
 }
