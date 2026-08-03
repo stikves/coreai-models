@@ -53,6 +53,16 @@ struct VideoRunner: AsyncParsableCommand {
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
+    @Option(
+        name: .customLong("dump-intermediates"),
+        help: "Dump intermediate tensors to directory for parity testing")
+    var dumpIntermediates: String?
+
+    @Option(
+        name: .customLong("load-noise"),
+        help: "Load initial noise from raw float32 binary file (for parity testing)")
+    var loadNoise: String?
+
     func run() async throws {
         let modelURL = URL(fileURLWithPath: model)
 
@@ -135,8 +145,16 @@ struct VideoRunner: AsyncParsableCommand {
             numFrames: frameCount,
             fps: outputFPS,
             width: width,
-            height: height
+            height: height,
+            dumpDirectory: dumpIntermediates,
+            loadNoisePath: loadNoise
         )
+
+        if let dumpDir = dumpIntermediates {
+            try FileManager.default.createDirectory(
+                atPath: dumpDir, withIntermediateDirectories: true)
+            print("  Dump Dir:       \(dumpDir)")
+        }
 
         print("Video Generation Configuration")
         print("  Model:          \(model)")

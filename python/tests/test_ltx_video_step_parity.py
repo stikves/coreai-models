@@ -132,9 +132,19 @@ def generate_reference(args):
     # === Stage 5: RoPE ===
     print("\n[05] Computing RoPE...")
     rope_module = pipe.transformer.rope
+    # The actual pipeline passes rope_interpolation_scale = (temporal/fps, spatial, spatial)
+    vae_temporal = 8
+    vae_spatial = 32
+    frame_rate = fps if 'fps' in dir() else 24
+    rope_interpolation_scale = (
+        vae_temporal / frame_rate,
+        vae_spatial,
+        vae_spatial,
+    )
     with torch.no_grad():
         rope_cos, rope_sin = rope_module(
-            noise, num_frames=latent_frames, height=latent_h, width=latent_w
+            noise, num_frames=latent_frames, height=latent_h, width=latent_w,
+            rope_interpolation_scale=rope_interpolation_scale
         )
 
     save_tensor(output_dir / "05_rope_cos.npy", rope_cos.cpu())
@@ -178,6 +188,7 @@ def generate_reference(args):
                 num_frames=latent_frames,
                 height=latent_h,
                 width=latent_w,
+                rope_interpolation_scale=rope_interpolation_scale,
                 return_dict=False,
             )[0]
 

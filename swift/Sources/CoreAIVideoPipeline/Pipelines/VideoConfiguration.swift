@@ -17,6 +17,10 @@ public struct VideoConfiguration: Sendable {
     public var width: Int
     public var height: Int
     public var conditioningImage: CGImage?
+    /// When set, dump intermediate Float arrays as raw binary for parity testing.
+    public var dumpDirectory: String?
+    /// When set, load initial noise from this raw float32 binary file instead of generating.
+    public var loadNoisePath: String?
 
     public init(
         prompt: String,
@@ -28,7 +32,9 @@ public struct VideoConfiguration: Sendable {
         fps: Int = 24,
         width: Int = 512,
         height: Int = 320,
-        conditioningImage: CGImage? = nil
+        conditioningImage: CGImage? = nil,
+        dumpDirectory: String? = nil,
+        loadNoisePath: String? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -40,5 +46,7 @@ public struct VideoConfiguration: Sendable {
         self.width = width
         self.height = height
         self.conditioningImage = conditioningImage
+        self.dumpDirectory = dumpDirectory
+        self.loadNoisePath = loadNoisePath
     }
 }

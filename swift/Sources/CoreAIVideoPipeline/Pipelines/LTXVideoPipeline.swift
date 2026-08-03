@@ -181,6 +181,13 @@ public struct LTXVideoPipeline: VideoPipeline {
         let (textEmbeddings, attentionMask) = try await encodeText(configuration.prompt)
         if lazyModelLoading { await textEncoder.unloadResources() }
 
+        let dumpDir = configuration.dumpDirectory
+
+        if let dir = dumpDir {
+            dumpFloatArray(
+                textEmbeddings, shape: [1, Self.textSeqLen, captionChannels], to: "\(dir)/02_text_embeddings.npy")
+        }
+
         // 2. Compute latent dimensions
         let latentFrames = (numFrames - 1) / Self.temporalCompression + 1
         let latentH = height / Self.spatialCompression
@@ -189,18 +196,43 @@ public struct LTXVideoPipeline: VideoPipeline {
 
         // 3. Generate noise in packed format [1, seq_len, C]
         let noiseCount = videoSeqLen * latentChannels
-        var rng = NumPyRandomSource(seed: configuration.seed)
-        var latents = (0..<noiseCount).map { _ in Float(rng.nextNormal()) }
+        var latents: [Float]
+        if let noisePath = configuration.loadNoisePath {
+            let noiseData = try Data(contentsOf: URL(fileURLWithPath: noisePath))
+            latents = noiseData.withUnsafeBytes { ptr in
+                Array(ptr.bindMemory(to: Float.self))
+            }
+            precondition(latents.count == noiseCount,
+                         "Loaded noise has \(latents.count) elements, expected \(noiseCount)")
+        } else {
+            var rng = TorchRandomSource(seed: configuration.seed)
+            latents = (0..<noiseCount).map { _ in Float(rng.nextNormal()) }
+        }
+
+        if let dir = dumpDir {
+            dumpFloatArray(latents, shape: [1, videoSeqLen, latentChannels], to: "\(dir)/04_noise.npy")
+        }
 
         // 4. Compute 3D RoPE embeddings
         let (ropeCos, ropeSin) = computeLTXVideoRoPE(
-            numFrames: latentFrames, height: latentH, width: latentW, dim: innerDim)
+            numFrames: latentFrames, height: latentH, width: latentW, dim: innerDim, fps: fps)
 
-        // 5. Setup scheduler (flow matching Euler, no shift)
+        if let dir = dumpDir {
+            dumpFloatArray(ropeCos, shape: [1, videoSeqLen, innerDim], to: "\(dir)/05_rope_cos.npy")
+            dumpFloatArray(ropeSin, shape: [1, videoSeqLen, innerDim], to: "\(dir)/05_rope_sin.npy")
+        }
+
+        // 5. Setup scheduler (flow matching Euler with dynamic shift)
+        // mu = base_shift + (max_shift - base_shift) * (num_latent_pixels / (512*512))
+        let numLatentPixels = videoSeqLen * latentChannels
+        let baseShift: Float = 0.5
+        let maxShift: Float = 1.15
+        let mu = min(maxShift, baseShift + (maxShift - baseShift) * Float(numLatentPixels) / Float(512 * 512))
         let scheduler = DiscreteFlowScheduler(
             stepCount: steps,
             trainStepCount: 1000,
-            timeStepShift: 1.0
+            timeStepShift: 1.0,
+            mu: mu
         )
 
         // 6. Denoising loop
@@ -212,7 +244,13 @@ public struct LTXVideoPipeline: VideoPipeline {
         let int32Mask = attentionMask.map { Float($0) }
 
         for (step, t) in scheduler.timeSteps.enumerated() {
-            let timestepValue = Float(t) / 1000.0
+            let timestepValue = Float(t)
+
+            if let dir = dumpDir {
+                dumpFloatArray(
+                    latents, shape: [1, videoSeqLen, latentChannels],
+                    to: "\(dir)/07_step\(String(format: "%02d", step))_input_latents.npy")
+            }
 
             let output = try await transformer.run(floatInputs: [
                 (latents, [1, videoSeqLen, latentChannels]),
@@ -223,7 +261,19 @@ public struct LTXVideoPipeline: VideoPipeline {
                 (ropeSin, ropeShape),
             ])
 
+            if let dir = dumpDir {
+                dumpFloatArray(
+                    output, shape: [1, videoSeqLen, latentChannels],
+                    to: "\(dir)/07_step\(String(format: "%02d", step))_model_output.npy")
+            }
+
             latents = scheduler.step(output: output, timeStep: t, sample: latents)
+
+            if let dir = dumpDir {
+                dumpFloatArray(
+                    latents, shape: [1, videoSeqLen, latentChannels],
+                    to: "\(dir)/07_step\(String(format: "%02d", step))_output_latents.npy")
+            }
 
             let progress = VideoProgress(step: step + 1, totalSteps: steps, phase: .denoising)
             if !progressHandler(progress) { break }
@@ -236,11 +286,23 @@ public struct LTXVideoPipeline: VideoPipeline {
             latents, channels: latentChannels,
             frames: latentFrames, height: latentH, width: latentW)
 
+        if let dir = dumpDir {
+            dumpFloatArray(
+                unpackedLatents, shape: [1, latentChannels, latentFrames, latentH, latentW],
+                to: "\(dir)/08_unpacked_latents.npy")
+        }
+
         // 8. VAE decode
         _ = progressHandler(VideoProgress(step: 0, totalSteps: 1, phase: .decoding))
         let vaeShape = [1, latentChannels, latentFrames, latentH, latentW]
         let pixels = try await decoder.run(floatInputs: [(unpackedLatents, vaeShape)])
         if lazyModelLoading { await decoder.unloadResources() }
+
+        if let dir = dumpDir {
+            dumpFloatArray(
+                pixels, shape: [1, 3, numFrames, height, width],
+                to: "\(dir)/09_decoded_video.npy")
+        }
 
         // 9. Convert to frames
         // VAE output: [1, 3, output_frames, output_h, output_w]
@@ -295,21 +357,25 @@ public struct LTXVideoPipeline: VideoPipeline {
     /// - Apply `grid * 2 - 1` position mapping
     /// - Return (cos, sin) each of shape [1, seq_len, dim]
     func computeLTXVideoRoPE(
-        numFrames: Int, height: Int, width: Int, dim: Int
+        numFrames: Int, height: Int, width: Int, dim: Int, fps: Int
     ) -> ([Float], [Float]) {
         let seqLen = numFrames * height * width
         let freqDim = dim / 6
 
         // Build 3D coordinate grid and apply interpolation scaling
-        // grid[pos] = (f_coord, h_coord, w_coord) scaled by base resolution
+        // rope_interpolation_scale = (vae_temporal/fps, vae_spatial, vae_spatial)
+        let ropeScaleT = Float(Self.temporalCompression) / Float(fps)
+        let ropeScaleH = Float(Self.spatialCompression)
+        let ropeScaleW = Float(Self.spatialCompression)
+
         var gridCoords = [(Float, Float, Float)](repeating: (0, 0, 0), count: seqLen)
         for f in 0..<numFrames {
             for h in 0..<height {
                 for w in 0..<width {
                     let idx = f * height * width + h * width + w
-                    let fCoord = Float(f) / Float(Self.baseNumFrames)
-                    let hCoord = Float(h) / Float(Self.baseHeight)
-                    let wCoord = Float(w) / Float(Self.baseWidth)
+                    let fCoord = Float(f) * ropeScaleT * 1.0 / Float(Self.baseNumFrames)
+                    let hCoord = Float(h) * ropeScaleH * 1.0 / Float(Self.baseHeight)
+                    let wCoord = Float(w) * ropeScaleW * 1.0 / Float(Self.baseWidth)
                     gridCoords[idx] = (fCoord, hCoord, wCoord)
                 }
             }
@@ -479,4 +545,36 @@ public enum LTXVideoError: Error, LocalizedError {
             return "Invalid dimensions for LTX Video: \(detail)"
         }
     }
+}
+
+// MARK: - Parity Dump Helpers
+
+/// Write a Float array as a raw .npy file (numpy format) for parity comparison.
+func dumpFloatArray(_ data: [Float], shape: [Int], to path: String) {
+    // Write numpy .npy format: magic + header + raw data
+    let header = numpyHeader(shape: shape, dtype: "<f4")
+    var fileData = Data()
+    fileData.append(contentsOf: [0x93])  // magic
+    fileData.append("NUMPY".data(using: .ascii)!)
+    fileData.append(contentsOf: [0x01, 0x00])  // version 1.0
+    let headerBytes = header.data(using: .ascii)!
+    let paddedLen = ((headerBytes.count + 10 + 63) / 64) * 64 - 10
+    let padCount = paddedLen - headerBytes.count
+    var paddedHeader = header + String(repeating: " ", count: padCount - 1) + "\n"
+    let headerData = paddedHeader.data(using: .ascii)!
+    let headerLen = UInt16(headerData.count)
+    fileData.append(contentsOf: withUnsafeBytes(of: headerLen.littleEndian) { Array($0) })
+    fileData.append(headerData)
+    data.withUnsafeBufferPointer { buf in
+        fileData.append(Data(buffer: buf))
+    }
+    try? fileData.write(to: URL(fileURLWithPath: path))
+}
+
+private func numpyHeader(shape: [Int], dtype: String) -> String {
+    let shapeStr =
+        shape.count == 1
+        ? "(\(shape[0]),)"
+        : "(" + shape.map(String.init).joined(separator: ", ") + ")"
+    return "{'descr': '\(dtype)', 'fortran_order': False, 'shape': \(shapeStr), }"
 }
