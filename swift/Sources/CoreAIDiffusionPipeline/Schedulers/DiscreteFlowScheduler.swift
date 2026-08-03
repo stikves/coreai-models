@@ -27,7 +27,8 @@ public final class DiscreteFlowScheduler {
         trainStepCount: Int = 1000,
         timeStepShift: Float = 3.0,
         mu: Float? = nil,
-        sigmaMax: Float = 1.0
+        sigmaMax: Float = 1.0,
+        shiftTerminal: Float? = nil
     ) {
         precondition(trainStepCount > 0 && stepCount > 0)
         self.trainStepCount = trainStepCount
@@ -59,6 +60,12 @@ public final class DiscreteFlowScheduler {
             inferSigmas = inferSigmas.map { sigma in
                 timeStepShift * sigma / (1.0 + (timeStepShift - 1.0) * sigma)
             }
+        }
+
+        // Stretch sigma schedule so the last sigma equals shiftTerminal
+        if let terminal = shiftTerminal, let lastSigma = inferSigmas.last, lastSigma != terminal {
+            let scale = (1.0 - terminal) / (1.0 - lastSigma)
+            inferSigmas = inferSigmas.map { 1.0 - (1.0 - $0) * scale }
         }
 
         let ts = trainSteps

@@ -65,6 +65,67 @@ public struct LTXVideoPipeline: VideoPipeline {
     private static let baseHeight = 2048
     private static let baseWidth = 2048
 
+    /// Scheduler dynamic shift config (from pipeline's calculate_shift defaults).
+    private static let schedulerBaseShift: Float = 0.5
+    private static let schedulerMaxShift: Float = 1.15
+    private static let schedulerBaseSeqLen = 256
+    private static let schedulerMaxSeqLen = 4096
+    private static let schedulerShiftTerminal: Float = 0.1
+
+    /// Per-channel latent normalization constants from the VAE.
+    /// Applied before VAE decode: `latents = latents * std + mean`
+    private static let latentsMean: [Float] = [
+        0.0062260679, 0.5863826871, -0.0083575649, 0.0073367460, 0.0193104576, -0.0033031332, 0.0427718349,
+        -0.0107671693,
+        -0.0873071477, 0.0151495999, -0.0227225758, -0.0296765771, -0.0370010175, 0.0017160751, 0.0231248923,
+        0.0024876310,
+        0.0174402986, -0.0211629067, -0.0779779851, 0.0414735489, 0.0354571119, -0.0058271517, 0.2772933841,
+        0.0270700175,
+        0.0085082594, 0.0232126079, -0.0360836796, -0.0088464087, 0.0109929042, 0.0004792456, 0.0273541007,
+        -0.0373579971,
+        0.0076416233, 0.0240560789, -0.5973715186, 0.3681030571, -0.0025784865, -0.1127476469, -0.0148251625,
+        -0.0666835532,
+        -0.0009411157, -0.0364750288, -0.0157159120, 0.0070373514, -0.0031819651, -0.0026152285, -0.0135523612,
+        0.0080103017,
+        -0.0128636984, 0.0007635652, -0.0065113311, -0.1776206344, -0.0330871642, -0.5717013478, 0.0334796645,
+        -0.0113540068,
+        -0.0030806526, 0.0011275313, -0.0284959618, 0.0305780172, -0.1181189418, 0.0230084918, 0.0447164550,
+        0.4700492322,
+        -0.0001458218, -0.0060548522, 0.0005832699, -0.0245847180, -0.0715347528, -0.0396952145, -0.0516441427,
+        0.0486397743,
+        0.0475833714, 0.0202851314, 0.0145366397, 0.0116224978, -0.0271287616, 0.0096076457, 0.0139234299, 0.0676308051,
+        -0.0023876783, 0.0120647941, 0.0270057376, 0.0153926127, -0.0648916811, -0.0168304332, 0.0086950287,
+        -0.0189278554,
+        -0.0124308607, -0.0176466275, 0.0016937823, -0.0577121675, -0.0301239174, 0.0038800582, 0.0086773364,
+        -0.0270932503,
+        0.0213783178, 0.0199798904, -0.0237105750, -0.0546951517, 0.0038255141, 0.0115539841, 0.0403805263,
+        0.0404359698,
+        0.0170415975, 0.0294417236, 0.0279521067, -0.0290744044, -0.0420474969, -0.0019558922, -0.0029178418,
+        0.0079313358,
+        0.0005729481, -0.0193307623, -0.0282343440, 0.0077548423, -0.0116254482, 0.0066454881, 0.0638077408,
+        -0.1720569730,
+        0.0482578874, 0.0083076404, 0.0181196295, -0.0117301382, -0.0218523704, -0.0219362080, 0.8754396439,
+        -0.0345934592,
+    ]
+    private static let latentsStd: [Float] = [
+        0.1581486613, 0.7276372313, 0.1683308929, 0.1564757079, 0.1539085507, 0.1690672636, 0.1357389390, 0.1520835757,
+        0.1864421666, 0.1491495371, 0.1484427750, 0.1558239013, 0.1238450333, 0.1365994066, 0.1622022092, 0.1372174621,
+        0.1239503846, 0.1268946826, 0.2374305725, 0.1796440035, 0.1913120449, 0.1222782955, 1.0874702930, 0.1645143926,
+        0.1343666166, 0.1296527237, 0.1585561484, 0.1551885903, 0.1704022735, 0.1830777824, 0.1788911223, 0.1375273168,
+        0.2656687796, 0.1962041110, 0.5112597346, 1.4067834616, 0.1298383474, 1.4135999680, 0.1660036743, 0.2374054193,
+        0.1704278737, 0.1630646735, 0.1943196654, 0.1516462266, 0.1156049147, 0.1376412660, 0.1412889212, 0.1613054276,
+        0.1414359212, 0.1252604425, 0.1463930607, 0.4995661974, 0.1594065726, 0.7375546098, 0.1564184427, 0.1722011268,
+        0.1697206944, 0.1345648319, 0.1645336896, 0.2965541482, 0.2260416895, 0.1417372823, 0.1525678486, 0.8827685714,
+        0.1551344246, 0.1375195682, 0.1311353147, 0.1399219781, 0.1508410871, 0.1409978122, 0.2019929290, 0.3189387023,
+        0.1620134860, 0.1444423646, 0.1403876692, 0.1133969873, 0.1227781102, 0.1748750806, 0.1553652138, 0.1449125707,
+        0.1537724286, 0.1417879462, 0.2034097314, 0.1349536031, 0.2014825642, 0.1606913507, 0.1333706528, 0.1199620292,
+        0.1191484332, 0.1304643601, 0.1646855921, 0.1876513660, 0.1330189556, 0.1401724964, 0.1358096302, 0.2188816816,
+        0.1384174675, 0.1782394499, 0.1723503768, 0.1660412550, 0.1481276155, 0.1715718061, 0.1598147005, 0.1546152234,
+        0.1773907840, 0.1440463513, 0.1691530496, 0.1679943055, 0.1628001481, 0.1420048028, 0.1713410914, 0.1455415934,
+        0.1576869935, 0.1456277221, 0.1618382335, 0.1473743767, 0.1454136819, 0.1771589369, 0.1514894217, 0.2312595546,
+        0.1285823882, 0.1835023612, 0.1804816127, 0.2613261640, 0.1565167457, 0.1263149083, 0.5880963802, 0.1320173144,
+    ]
+
     // MARK: - Init
 
     public init(
@@ -202,8 +263,9 @@ public struct LTXVideoPipeline: VideoPipeline {
             latents = noiseData.withUnsafeBytes { ptr in
                 Array(ptr.bindMemory(to: Float.self))
             }
-            precondition(latents.count == noiseCount,
-                         "Loaded noise has \(latents.count) elements, expected \(noiseCount)")
+            precondition(
+                latents.count == noiseCount,
+                "Loaded noise has \(latents.count) elements, expected \(noiseCount)")
         } else {
             var rng = TorchRandomSource(seed: configuration.seed)
             latents = (0..<noiseCount).map { _ in Float(rng.nextNormal()) }
@@ -223,16 +285,18 @@ public struct LTXVideoPipeline: VideoPipeline {
         }
 
         // 5. Setup scheduler (flow matching Euler with dynamic shift)
-        // mu = base_shift + (max_shift - base_shift) * (num_latent_pixels / (512*512))
-        let numLatentPixels = videoSeqLen * latentChannels
-        let baseShift: Float = 0.5
-        let maxShift: Float = 1.15
-        let mu = min(maxShift, baseShift + (maxShift - baseShift) * Float(numLatentPixels) / Float(512 * 512))
+        // mu = m * seq_len + b (linear interpolation by sequence length)
+        let m =
+            (Self.schedulerMaxShift - Self.schedulerBaseShift)
+            / Float(Self.schedulerMaxSeqLen - Self.schedulerBaseSeqLen)
+        let b = Self.schedulerBaseShift - m * Float(Self.schedulerBaseSeqLen)
+        let mu = m * Float(videoSeqLen) + b
         let scheduler = DiscreteFlowScheduler(
             stepCount: steps,
             trainStepCount: 1000,
             timeStepShift: 1.0,
-            mu: mu
+            mu: mu,
+            shiftTerminal: Self.schedulerShiftTerminal
         )
 
         // 6. Denoising loop
@@ -282,9 +346,20 @@ public struct LTXVideoPipeline: VideoPipeline {
         if lazyModelLoading { await transformer.unloadResources() }
 
         // 7. Unpack latents: [1, seq_len, C] -> [1, C, T, H, W]
-        let unpackedLatents = unpackLatents3D(
+        var unpackedLatents = unpackLatents3D(
             latents, channels: latentChannels,
             frames: latentFrames, height: latentH, width: latentW)
+
+        // 7b. Denormalize latents before VAE decode: latents = latents * std + mean
+        let spatialSize = latentFrames * latentH * latentW
+        for c in 0..<latentChannels {
+            let mean = Self.latentsMean[c]
+            let std = Self.latentsStd[c]
+            let offset = c * spatialSize
+            for i in 0..<spatialSize {
+                unpackedLatents[offset + i] = unpackedLatents[offset + i] * std + mean
+            }
+        }
 
         if let dir = dumpDir {
             dumpFloatArray(
