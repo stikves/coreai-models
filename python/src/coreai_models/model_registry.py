@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from coreai_models._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
+from coreai_models.export._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -127,6 +127,39 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         32768,
+    ),
+    ModelPreset(
+        "phi-4-mini-instruct",
+        "microsoft/Phi-4-mini-instruct",
+        "phi3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        131072,
+        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
+    ),
+    ModelPreset(
+        "phi-3-mini-instruct",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "phi3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        4096,
+        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
+    ),
+    ModelPreset(
+        "phi-3.5-mini-instruct",
+        "microsoft/Phi-3.5-mini-instruct",
+        "phi3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        131072,
+        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
     ),
     ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
