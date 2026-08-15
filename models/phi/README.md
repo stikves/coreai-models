@@ -1,24 +1,14 @@
-# Phi Family
+# Phi
 
 Microsoft's Phi-3, Phi-3.5, and Phi-4 mini models for on-device inference via Core AI.
 
 ## Supported Models
 
-| Model                    | Parameters | Context | Attention       | macOS | iOS |
-| ------------------------ | ---------- | ------- | --------------- | ----- | --- |
-| Phi-4-mini-instruct      | 3.8B       | 131072  | GQA + LongRoPE  | Yes   | No  |
-| Phi-3.5-mini-instruct    | 3.8B       | 131072  | MHA + LongRoPE  | Yes   | No  |
-| Phi-3-mini-4k-instruct   | 3.8B       | 4096    | MHA + SWA       | Yes   | No  |
-
-**Architecture notes:**
-
-- **Phi-4** uses grouped-query attention (24 Q / 8 KV heads) with separate Q/K/V
-  projections. MHA models (Phi-3, Phi-3.5) use a faster fused QKV projection.
-- **Phi-3.5 and Phi-4** use LongRoPE to extend context from 4096 to 131072 tokens.
-  Per-dimension frequency rescaling factors are read from the HF config and applied
-  at init time. An attention scaling factor dampens Q/K magnitudes for long contexts.
-- **Phi-3** uses sliding window attention (window size 2047).
-- All models use a fused gate+up MLP (`gate_up_proj` with `chunk(2)`).
+| Model                  | Parameters | Context | macOS | iOS |
+| ---------------------- | ---------- | ------- | ----- | --- |
+| Phi-4-mini-instruct    | 3.8B       | 131072  | Yes   | No  |
+| Phi-3.5-mini-instruct  | 3.8B       | 131072  | Yes   | No  |
+| Phi-3-mini-4k-instruct | 3.8B       | 4096    | Yes   | Yes |
 
 ## Setup to export models
 
@@ -38,6 +28,22 @@ uv run coreai.llm.export microsoft/Phi-3.5-mini-instruct
 
 # Phi-3-mini (4K context)
 uv run coreai.llm.export microsoft/Phi-3-mini-4k-instruct
+
+# Phi-3-mini iOS
+uv run coreai.llm.export microsoft/Phi-3-mini-4k-instruct --platform iOS
+```
+
+**Options:**
+
+```bash
+# Full precision
+uv run coreai.llm.export microsoft/Phi-4-mini-instruct --compression none
+
+# Custom output directory
+uv run coreai.llm.export microsoft/Phi-4-mini-instruct --output-dir ./my-models/
+
+# Preview resolved config without exporting
+uv run coreai.llm.export microsoft/Phi-4-mini-instruct --dry-run
 ```
 
 ## Run a Core AI Language Model
@@ -75,16 +81,25 @@ Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p
 
 Perplexity score on the [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) dataset computed using the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/wikitext/README.md) with the Core AI PyTorch models.
 
-| Model        | Compression                                    | Platform | Perplexity Score |
-| ------------ | ---------------------------------------------- | -------- | ---------------- |
-| Phi-3-mini   | none (`float16`)                               | macOS    | 9.47             |
-| Phi-3-mini   | [INT4 with FP16 embedding][phi-4bit-yaml]      | macOS    | 11.24            |
-| Phi-3.5-mini | none (`float16`)                               | macOS    | 9.98             |
-| Phi-3.5-mini | [INT4 with FP16 embedding][phi-4bit-yaml]      | macOS    | 12.04            |
-| Phi-4-mini   | none (`float16`)                               | macOS    | 11.12            |
-| Phi-4-mini   | [INT4 with FP16 embedding][phi-4bit-yaml]      | macOS    | 12.80            |
+| Model        | Compression                               | Platform | Perplexity Score |
+| ------------ | ----------------------------------------- | -------- | ---------------- |
+| Phi-3-mini   | none (`float16`)                          | macOS    | 9.47             |
+| Phi-3-mini   | [INT4 with FP16 embedding][phi-4bit-yaml] | macOS    | 11.24            |
+| Phi-3.5-mini | none (`float16`)                          | macOS    | 9.98             |
+| Phi-3.5-mini | [INT4 with FP16 embedding][phi-4bit-yaml] | macOS    | 12.04            |
+| Phi-4-mini   | none (`float16`)                          | macOS    | 11.12            |
+| Phi-4-mini   | [INT4 with FP16 embedding][phi-4bit-yaml] | macOS    | 12.80            |
 
-The embedding is kept at FP16 because Phi models have `tie_word_embeddings=True` —
-INT4 on the shared embedding/lm_head tensor degrades generation quality.
+The embedding is kept at FP16 because the embedding tensor is large relative to the
+model — excluding it from INT4 improves generation quality.
 
 [phi-4bit-yaml]: phi_4bit_embedding_excluded.yaml
+
+## Architecture Notes
+
+- All three models share the `phi3` architecture class
+- Fused gate+up MLP (`gate_up_proj` chunked into gate and up)
+- **Phi-4**: GQA (32 Q / 8 KV heads) with separate Q/K/V projections, LongRoPE,
+  `partial_rotary_factor=0.75`
+- **Phi-3.5**: MHA (32/32 heads) with fused QKV, LongRoPE
+- **Phi-3**: MHA with fused QKV, sliding window attention (window=2047)

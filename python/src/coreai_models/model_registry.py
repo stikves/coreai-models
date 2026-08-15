@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from coreai_models.export._constants import IOS_DEFAULT_MAX_CONTEXT_LENGTH
+IOS_DEFAULT_MAX_CONTEXT_LENGTH = 4096
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -140,17 +140,6 @@ LLM_PRESETS: list[ModelPreset] = [
         compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
     ),
     ModelPreset(
-        "phi-3-mini-instruct",
-        "microsoft/Phi-3-mini-4k-instruct",
-        "phi3",
-        "llm",
-        "macOS",
-        "4bit",
-        "float16",
-        4096,
-        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
-    ),
-    ModelPreset(
         "phi-3.5-mini-instruct",
         "microsoft/Phi-3.5-mini-instruct",
         "phi3",
@@ -162,9 +151,30 @@ LLM_PRESETS: list[ModelPreset] = [
         compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
     ),
     ModelPreset(
+        "phi-3-mini-instruct",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "phi3",
+        "llm",
+        "macOS",
+        "4bit",
+        "float16",
+        4096,
+        compression_config="models/phi/phi_4bit_embedding_excluded.yaml",
+    ),
+    ModelPreset(
         "gpt-oss-20b", "openai/gpt-oss-20b", "gpt-oss", "llm", "macOS", "none", "bfloat16", 32768
     ),
     # --- iOS (compression = palettized) ---
+    ModelPreset(
+        "phi-3-mini-instruct",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "phi3",
+        "llm",
+        "iOS",
+        "4bit_weight_palettized_group8",
+        "float16",
+        IOS_DEFAULT_MAX_CONTEXT_LENGTH,
+    ),
     ModelPreset(
         "qwen3-0.6b",
         "Qwen/Qwen3-0.6B",
