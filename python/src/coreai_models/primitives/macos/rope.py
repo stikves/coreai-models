@@ -62,6 +62,7 @@ class DecomposedRoPE(torch.nn.Module):
         input: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         offset: torch.Tensor | None = None,
+        freqs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Apply rotary positional embedding.
@@ -70,6 +71,7 @@ class DecomposedRoPE(torch.nn.Module):
             input: Tensor of shape (..., num_heads, seq_len, head_dim).
             position_ids: Tensor of shape (batch, seq_len) with position indices.
             offset: Scalar or tensor offset when position_ids is None.
+            freqs: Pre-computed inverse frequencies (overrides self.base computation).
 
         Returns:
             Tensor with RoPE applied to the first `dims` elements of head_dim.
@@ -97,9 +99,12 @@ class DecomposedRoPE(torch.nn.Module):
 
         pos = pos.float()
 
-        # Compute inverse frequencies in f32: 1 / (base ^ (i / half_dim))
-        exponent = torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
-        inv_freq = 1.0 / torch.pow(self.base, exponent)
+        # Use provided freqs (e.g. from LongRoPE) or compute standard inv_freq
+        if freqs is not None:
+            inv_freq = freqs
+        else:
+            exponent = torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
+            inv_freq = 1.0 / torch.pow(self.base, exponent)
 
         # Compute angles: (batch, 1, seq_len, 1) * (half_dim,) -> (batch, 1, seq_len, half_dim)
         angle = pos.unsqueeze(-1) * inv_freq
