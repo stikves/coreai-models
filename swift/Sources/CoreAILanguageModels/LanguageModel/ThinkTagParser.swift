@@ -113,6 +113,9 @@ struct ThinkTagParser {
 
         var events: [Event] = []
         while true {
+            // Strip entry markers at the start of buffer after a transition
+            stripEntryMarker(selfMarker: selfMarker, userMarker: userMarker)
+
             if insideThink {
                 if let range = buffer.range(of: eom) {
                     let before = String(buffer[buffer.startIndex..<range.lowerBound])
@@ -144,6 +147,19 @@ struct ThinkTagParser {
                     return emitSafe(events: &events, holdBack: isFinal ? 0 : holdBack, asReasoning: false)
                 }
             }
+        }
+    }
+
+    /// After a mode transition, the buffer may start with the new mode's entry
+    /// marker (e.g. "to=user<|message|>" after reasoning ends). Strip it and
+    /// set the correct mode based on which marker was found.
+    private mutating func stripEntryMarker(selfMarker: String, userMarker: String) {
+        if buffer.hasPrefix(selfMarker) {
+            buffer = String(buffer.dropFirst(selfMarker.count))
+            insideThink = true
+        } else if buffer.hasPrefix(userMarker) {
+            buffer = String(buffer.dropFirst(userMarker.count))
+            insideThink = false
         }
     }
 
