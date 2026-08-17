@@ -6,6 +6,7 @@
 import Testing
 
 @testable import CoreAILanguageModels
+import TestUtilities
 
 #if (arch(arm64) || arch(arm64e)) && canImport(CoreAI)
 
@@ -231,6 +232,83 @@ struct ThinkTagParserAgenticTests {
             case (.reasoning(let s), .reasoning): return s
             default: return nil
             }
+        }
+    }
+}
+
+@Suite("ThinkTagParser — Format detection")
+struct ThinkTagParserDetectionTests {
+    @Test("Qwen3/DeepSeek tokenizer detects tag-pair format")
+    func detectsTagPairForThinkTokens() {
+        let tokenizer = MockTokenizer(vocab: [
+            "<think>": 100, "</think>": 101,
+            "<eos>": 2,
+        ])
+        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        guard case .tagPair(let open, let close) = format else {
+            Issue.record("Expected .tagPair, got \(format)")
+            return
+        }
+        #expect(open == "<think>")
+        #expect(close == "</think>")
+    }
+
+    @Test("Agentic tokenizer (eom+eot) detects agentic format")
+    func detectsAgenticFormat() {
+        let tokenizer = MockTokenizer(vocab: [
+            "<|eom|>": 200, "<|eot|>": 201,
+            "<|message|>": 202,
+            "<eos>": 2,
+        ])
+        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        guard case .agentic(let selfM, let userM, let eom, let eot) = format else {
+            Issue.record("Expected .agentic, got \(format)")
+            return
+        }
+        #expect(selfM == "to=self<|message|>")
+        #expect(userM == "to=user<|message|>")
+        #expect(eom == "<|eom|>")
+        #expect(eot == "<|eot|>")
+    }
+
+    @Test("Tokenizer with reasoning_start/end detects that variant")
+    func detectsReasoningStartEnd() {
+        let tokenizer = MockTokenizer(vocab: [
+            "<|reasoning_start|>": 300, "<|reasoning_end|>": 301,
+            "<eos>": 2,
+        ])
+        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        guard case .tagPair(let open, let close) = format else {
+            Issue.record("Expected .tagPair, got \(format)")
+            return
+        }
+        #expect(open == "<|reasoning_start|>")
+        #expect(close == "<|reasoning_end|>")
+    }
+
+    @Test("Plain tokenizer (no special tokens) falls back to <think>")
+    func fallbackToThinkTags() {
+        let tokenizer = MockTokenizer(vocab: ["<eos>": 2])
+        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        guard case .tagPair(let open, let close) = format else {
+            Issue.record("Expected .tagPair, got \(format)")
+            return
+        }
+        #expect(open == "<think>")
+        #expect(close == "</think>")
+    }
+
+    @Test("Agentic format takes priority over tag-pair when both present")
+    func agenticPriorityOverTagPair() {
+        let tokenizer = MockTokenizer(vocab: [
+            "<think>": 100, "</think>": 101,
+            "<|eom|>": 200, "<|eot|>": 201,
+            "<eos>": 2,
+        ])
+        let format = CoreAILanguageModel.CoreAIExecutor.detectThinkingFormat(using: tokenizer)
+        guard case .agentic = format else {
+            Issue.record("Expected .agentic (priority), got \(format)")
+            return
         }
     }
 }
