@@ -170,6 +170,16 @@ def build_parser() -> argparse.ArgumentParser:
             "--platform is macOS."
         ),
     )
+    parser.add_argument(
+        "--with-drafter",
+        action="store_true",
+        help=(
+            "Export the speculative decoding drafter model alongside the target. "
+            "The drafter is bundled as a second asset in the same output directory "
+            "and referenced in metadata.json. Requires the model to have a registered "
+            "drafter class (currently: Muse Glimmer DFlash)."
+        ),
+    )
     return parser
 
 
@@ -387,6 +397,7 @@ def _resolve_export_config(args: argparse.Namespace) -> ExportConfig:
         compression_config_object=compression_config_object,
         disable_embedding_quantization=args.disable_embedding_quantization_ios,
         include_debug_info=args.include_debug_info,
+        with_drafter=args.with_drafter,
     )
 
 

@@ -22,6 +22,7 @@ public struct LanguageBundle: Sendable {
     public let modelAssetPath: String
     public let language: LanguageConfig
     public let visionConfig: VisionConfig?
+    public let drafterAssetPath: String?
 
     public init(from path: String) throws {
         let expanded = (path as NSString).expandingTildeInPath
@@ -47,6 +48,7 @@ public struct LanguageBundle: Sendable {
         self.modelAssetPath = main
         self.language = language
         self.visionConfig = payload.vision
+        self.drafterAssetPath = payload.assets.drafter
 
         if bundle.kind == .vlm && self.visionConfig == nil {
             throw ModelBundle.BundleError.missingField("vision")
@@ -108,6 +110,7 @@ extension LanguageBundle {
 
         struct Assets: Decodable {
             let main: String?
+            let drafter: String?
         }
     }
 }

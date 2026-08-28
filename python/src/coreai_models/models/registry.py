@@ -73,6 +73,8 @@ class ModelEntry:
 
     macos_class: type[nn.Module] | None = None
     ios_class: type[nn.Module] | None = None
+    drafter_class: type[nn.Module] | None = None
+    drafter_hf_model_id: str | None = None
     # Multimodal-checkpoint hooks consumed by `from_hf_memory_efficient` and the
     # `text_config` unwrap in the export pipeline.
     # `hf_config_attr`: attribute on the top-level HF config holding the
@@ -94,6 +96,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
     from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLM
+    from coreai_models.models.macos.muse_glimmer_drafter_ring import MuseGlimmerDrafterForCausalLM
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
@@ -120,6 +123,8 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "muse_glimmer_text": ModelEntry(
             macos_class=MuseGlimmerForCausalLM,
+            drafter_class=MuseGlimmerDrafterForCausalLM,
+            drafter_hf_model_id="meta-models/Muse-Glimmer-30B-assistant",
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
         ),

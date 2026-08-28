@@ -73,6 +73,8 @@ class ExportConfig:
     # QuantizerConfig) loaded from a user-provided YAML. When set, the pipeline
     # uses this directly and ignores `compression` for config resolution
     compression_config_object: Any = field(default=None, repr=False)
+    # Export the speculative decoding drafter alongside the target model.
+    with_drafter: bool = False
 
     def __post_init__(self) -> None:
         if self.quantization_mode == "graph" and self.variant != "macOS":
@@ -374,7 +376,32 @@ async def _async_export_model(config: ExportConfig) -> str:
             hf_config=hf_config,
             compression=config.compression,
             name=output_name,
+            drafter_name=f"{output_name}_drafter" if config.with_drafter else None,
+            speculative_config={"draft_length": 16} if config.with_drafter else None,
         )
+
+        # ---- 6. Export drafter (optional) ----
+        if config.with_drafter:
+            if entry.drafter_class is None:
+                raise ValueError(
+                    f"Model '{model_type}' does not have a registered drafter class. "
+                    "Remove --with-drafter or register a drafter_class in the model registry."
+                )
+            logger.info("Exporting speculative decoding drafter...")
+            drafter_name = f"{output_name}_drafter"
+            drafter_model = entry.drafter_class.from_hf(
+                config.hf_model_id, dtype=target_dtype, config=hf_config
+            )
+            drafter_program = await export_macos_model(
+                drafter_model, hf_config, config
+            )
+            drafter_path = bundle_path / f"{drafter_name}.aimodel"
+            drafter_metadata = build_aimodel_metadata(config.hf_model_id)
+            await asyncio.to_thread(
+                drafter_program.save_asset, drafter_path, drafter_metadata
+            )
+            del drafter_model, drafter_program
+            logger.info(f"Drafter exported: {drafter_path}")
 
     logger.info(f"Export complete: {bundle_path}")
     return str(bundle_path)

@@ -24,13 +24,19 @@ def bundle_llm_asset(
     hf_config: Any,
     compression: str,
     name: str,
+    drafter_name: str | None = None,
+    speculative_config: dict[str, Any] | None = None,
 ) -> None:
     """Add tokenizer and metadata.json (0.2 schema) to an LLM bundle.
 
     Expects ``{name}.aimodel`` to already exist inside bundle_path.
+    If drafter_name is provided, expects ``{drafter_name}.aimodel`` as well.
     """
     _write_tokenizer(bundle_path / "tokenizer", hf_model_id)
-    _write_metadata(bundle_path, hf_model_id, hf_config, compression, name)
+    _write_metadata(
+        bundle_path, hf_model_id, hf_config, compression, name,
+        drafter_name=drafter_name, speculative_config=speculative_config,
+    )
 
 
 def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
@@ -45,12 +51,18 @@ def _write_metadata(
     hf_config: Any,
     compression: str,
     name: str,
+    drafter_name: str | None = None,
+    speculative_config: dict[str, Any] | None = None,
 ) -> None:
+    assets: dict[str, str] = {"main": f"{name}.aimodel"}
+    if drafter_name:
+        assets["drafter"] = f"{drafter_name}.aimodel"
+
     metadata: dict[str, Any] = {
         "metadata_version": METADATA_VERSION,
         "kind": "llm",
         "name": name,
-        "assets": {"main": f"{name}.aimodel"},
+        "assets": assets,
         "language": {
             "tokenizer": hf_model_id,
             "vocab_size": getattr(hf_config, "vocab_size", None),
@@ -68,6 +80,10 @@ def _write_metadata(
             "targets": [],
         },
     }
+
+    if speculative_config:
+        metadata["speculative"] = speculative_config
+
     metadata_path = bundle_path / "metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)

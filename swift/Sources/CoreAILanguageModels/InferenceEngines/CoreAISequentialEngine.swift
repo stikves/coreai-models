@@ -73,6 +73,11 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
+    // Speculative decoding state
+    private(set) var drafterEngine: CoreAISequentialEngine?
+    private(set) var drafterAssetURL: URL?
+    private var _isDrafterEnabled = false
+
     // Track in-flight generation via token (replaces simple bool lock)
     private let _activeToken = Mutex<GenerationToken?>(nil)
 
@@ -444,6 +449,37 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
         resetSpan.end()
     }
 
+    // MARK: - Speculative Decoding
+
+    /// Process draft tokens in one batched forward pass, returning per-position logits.
+    /// Does NOT create a GenerationToken — safe to call during an active generation.
+    func batchVerify(draftTokens: [Int32]) async throws -> [[LogitsScalarType]] {
+        guard !draftTokens.isEmpty else { return [] }
+
+        let flatLogits = try await processTokenBatch(draftTokens[...])
+        let V = config.vocabSize
+        var perPosition = [[LogitsScalarType]]()
+        perPosition.reserveCapacity(draftTokens.count)
+
+        for i in 0..<draftTokens.count {
+            let start = i * V
+            perPosition.append(Array(flatLogits[start..<(start + V)]))
+        }
+
+        return perPosition
+    }
+
+    /// Rewind processedTokenCount without cancelling the active generation or
+    /// truncating history. Stale KV entries beyond the new count are harmless —
+    /// the next forward pass overwrites them via position_ids.
+    func internalRollback(to tokenIndex: Int) {
+        precondition(
+            tokenIndex >= 0 && tokenIndex <= processedTokenCount,
+            "internalRollback(to: \(tokenIndex)) out of range [0, \(processedTokenCount)]"
+        )
+        processedTokenCount = tokenIndex
+    }
+
     public func cleanup() {
         let cleanupSpan = InstrumentsProfiler.beginCleanup(engine: "CoreAIClean")
         CLILogger.log("CoreAI clean engine cleanup complete")
@@ -451,6 +487,40 @@ public final class CoreAISequentialEngine: InferenceEngine, @unchecked Sendable 
     }
 
     // MARK: - Helpers
+}
+
+// MARK: - SpeculativeCapable
+
+extension CoreAISequentialEngine: SpeculativeCapable {
+    public var hasDrafter: Bool { drafterAssetURL != nil }
+    public var isDrafterEnabled: Bool { _isDrafterEnabled }
+
+    public func loadAndEnableDrafter() async throws {
+        guard let url = drafterAssetURL else {
+            throw InferenceRuntimeError.invalidState("No drafter asset in bundle")
+        }
+        guard !hasNonTruncatableStates else {
+            throw InferenceRuntimeError.invalidState(
+                "Speculative decoding not supported for models with non-truncatable states"
+            )
+        }
+        guard drafterEngine == nil else { return }
+
+        // Drafter loading requires the full EngineFactory pipeline to resolve
+        // ModelConfig from the drafter's metadata. For now, mark the URL for
+        // deferred loading — the factory will create the drafter engine when it
+        // creates the target engine (if a drafter asset is present).
+        CLILogger.log(
+            "Drafter asset registered: \(url.lastPathComponent). "
+                + "Call EngineFactory with drafter support to enable speculation.",
+            component: "Engine")
+    }
+
+    public func disableDrafter() async {
+        _isDrafterEnabled = false
+        drafterEngine = nil
+        CLILogger.log("Speculative decoding disabled", component: "Engine")
+    }
 }
 
 extension CoreAISequentialEngine {
