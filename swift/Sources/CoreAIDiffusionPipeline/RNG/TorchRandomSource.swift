@@ -94,36 +94,48 @@ public struct TorchRandomSource: RandomNumberGenerator, RandomSource, Sendable {
 
     /// Matches torch.randn([shape], dtype=torch.float) behavior including
     /// the batch-16 Box-Muller optimization for arrays >= 16 elements.
+    ///
+    /// PyTorch's `normal_fill_16` first fills ALL elements with float32 uniforms,
+    /// then applies Box-Muller in 16-element blocks. For the remainder (count % 16 != 0),
+    /// it re-fills the last 16 positions with 16 fresh uniforms and re-applies Box-Muller.
+    /// This means count=17 consumes 17 + 16 = 33 total RNG draws.
     public mutating func normalArray(_ shape: [Int], mean: Double = 0.0, stdev: Double = 1.0) -> [Float] {
         let count = shape.reduce(1, *)
         guard count >= 16 else {
             return (0..<count).map { _ in Float(nextNormal(mean: mean, stdev: stdev)) }
         }
+
+        // Step 1: Fill all elements with float32 uniforms (matches PyTorch's initial fill).
         var data = (0..<count).map { _ in Double(nextFloat()) }
-        for i in stride(from: 0, to: count - 15, by: 16) {
+
+        // Step 2: Box-Muller on complete 16-element blocks.
+        for blockStart in stride(from: 0, to: count - 15, by: 16) {
             for j in 0..<8 {
-                let u1 = 1 - data[i + j]
-                let u2 = data[i + j + 8]
+                let u1 = 1 - data[blockStart + j]
+                let u2 = data[blockStart + j + 8]
                 let radius = sqrt(-2.0 * log(u1))
                 let theta = 2.0 * .pi * u2
-                data[i + j] = radius * cos(theta) * stdev + mean
-                data[i + j + 8] = radius * sin(theta) * stdev + mean
+                data[blockStart + j] = radius * cos(theta) * stdev + mean
+                data[blockStart + j + 8] = radius * sin(theta) * stdev + mean
             }
         }
+
+        // Step 3: Remainder — re-fill last 16 with fresh uniforms, re-apply Box-Muller.
         if count % 16 != 0 {
-            for i in (count - 16)..<count {
-                data[i] = nextDouble()
+            let blockStart = count - 16
+            for i in 0..<16 {
+                data[blockStart + i] = Double(nextFloat())
             }
-            let i = count - 16
             for j in 0..<8 {
-                let u1 = 1 - data[i + j]
-                let u2 = data[i + j + 8]
+                let u1 = 1 - data[blockStart + j]
+                let u2 = data[blockStart + j + 8]
                 let radius = sqrt(-2.0 * log(u1))
                 let theta = 2.0 * .pi * u2
-                data[i + j] = radius * cos(theta) * stdev + mean
-                data[i + j + 8] = radius * sin(theta) * stdev + mean
+                data[blockStart + j] = radius * cos(theta) * stdev + mean
+                data[blockStart + j + 8] = radius * sin(theta) * stdev + mean
             }
         }
+
         return data.map { Float($0) }
     }
 }
