@@ -103,6 +103,10 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     private let valueCacheName: String
     private let logitsName: String
 
+    // Optional 3rd input for models that need token IDs alongside embeddings (e.g. Gemma3n AltUp)
+    private let inputIdsName: String?
+    private let inputIdsDescriptor: NDArrayDescriptor?
+
     // LLM descriptors for dynamic shape resolution
     private let embeddingsInputDescriptor: NDArrayDescriptor
     private let positionIdsDescriptor: NDArrayDescriptor
@@ -224,10 +228,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         }
         self.llmFunctionDescriptor = llmDesc
 
-        // Validate LLM architecture: expects inputs for embeddings + position_ids, states for KV cache
-        guard llmDesc.inputNames.count == 2 else {
+        // Validate LLM architecture: 2 inputs (embeddings + position_ids) or
+        // 3 inputs (input_ids + embeddings + position_ids for AltUp models like Gemma3n)
+        guard llmDesc.inputNames.count == 2 || llmDesc.inputNames.count == 3 else {
             throw InferenceRuntimeError.invalidInputType(
-                "VLM LLM function expected 2 inputs (in_embeddings, position_ids), "
+                "VLM LLM function expected 2–3 inputs, "
                     + "got \(llmDesc.inputNames.count): \(llmDesc.inputNames)")
         }
         guard llmDesc.stateNames.count == 2 else {
@@ -241,9 +246,23 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
                     + "got \(llmDesc.outputNames.count): \(llmDesc.outputNames)")
         }
 
-        // Extract I/O names
-        self.embeddingsInputName = llmDesc.inputNames[0]
-        self.positionIdsName = llmDesc.inputNames[1]
+        // Extract I/O names — 3-input models have (input_ids, in_embeddings, position_ids)
+        if llmDesc.inputNames.count == 3 {
+            self.inputIdsName = llmDesc.inputNames[0]
+            self.embeddingsInputName = llmDesc.inputNames[1]
+            self.positionIdsName = llmDesc.inputNames[2]
+
+            guard case .ndArray(let idsDesc) = llmDesc.inputDescriptor(of: inputIdsName!) else {
+                throw InferenceRuntimeError.invalidInputType(
+                    "Cannot get descriptor for '\(inputIdsName!)'")
+            }
+            self.inputIdsDescriptor = idsDesc
+        } else {
+            self.inputIdsName = nil
+            self.inputIdsDescriptor = nil
+            self.embeddingsInputName = llmDesc.inputNames[0]
+            self.positionIdsName = llmDesc.inputNames[1]
+        }
         self.keyCacheName = llmDesc.stateNames[0]
         self.valueCacheName = llmDesc.stateNames[1]
         self.logitsName = llmDesc.outputNames[0]
@@ -688,7 +707,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
     /// - Returns: Logits for all tokens in the batch
     private func processEmbeddingBatch(
         embeddings: NDArray,
-        batchSize: Int
+        batchSize: Int,
+        tokenIds: ArraySlice<Int32>? = nil
     ) async throws -> [LogitsScalarType] {
         guard batchSize > 0 else {
             throw InferenceRuntimeError.invalidState("Cannot process empty embedding batch")
@@ -724,9 +744,21 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         var outputViews = InferenceFunction.MutableViews()
         outputViews.insert(&logitsArray, for: logitsName)
 
+        // Build LLM inputs
+        var llmInputs: [String: NDArray] = [
+            embeddingsInputName: embeddings,
+            positionIdsName: positionIds,
+        ]
+        if let idsName = inputIdsName, let idsDesc = inputIdsDescriptor, let tokens = tokenIds {
+            let resolvedIdsDesc = idsDesc.resolvingDynamicDimensions([1, batchSize])
+            var inputIdsArray = NDArray(descriptor: resolvedIdsDesc)
+            fillNDArray(&inputIdsArray, as: Int32.self, count: batchSize) { tokens[tokens.startIndex + $0] }
+            llmInputs[idsName] = inputIdsArray
+        }
+
         // Execute LLM forward pass
         _ = try await llmFunction.run(
-            inputs: [embeddingsInputName: embeddings, positionIdsName: positionIds],
+            inputs: llmInputs,
             states: consume states,
             outputViews: consume outputViews
         )
@@ -759,7 +791,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let embeddings = try await embedTokens(tokens)
 
         // Step 2: run LLM with embeddings
-        return try await processEmbeddingBatch(embeddings: embeddings, batchSize: batchSize)
+        return try await processEmbeddingBatch(
+            embeddings: embeddings, batchSize: batchSize, tokenIds: tokens)
     }
 
     // MARK: - VLM Prefill
@@ -796,7 +829,8 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         // Step 3: Run LLM with merged embeddings
         let logitBuffer = try await processEmbeddingBatch(
             embeddings: merged,
-            batchSize: tokens.count
+            batchSize: tokens.count,
+            tokenIds: tokens[...]
         )
 
         InstrumentsProfiler.endCustomInterval(

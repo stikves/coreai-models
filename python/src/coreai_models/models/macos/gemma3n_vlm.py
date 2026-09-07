@@ -5,8 +5,8 @@
 
 """Gemma 3n VLM components for CoreAI model export.
 
-Vision tower: MobileNetV5 via timm, outputs [B, 256, 2048] visual tokens.
-Text decoder: AltUp variant that accepts inputs_embeds + input_ids (for per-layer inputs).
+Vision tower: MobileNetV5 (224x224 → 256 visual tokens).
+Text decoder: AltUp variant accepting inputs_embeds + input_ids (for per-layer inputs).
 """
 
 import math
