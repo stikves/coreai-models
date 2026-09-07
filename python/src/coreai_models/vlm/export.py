@@ -597,9 +597,10 @@ class StaticVisionEncoder(nn.Module):
 class StaticVisionEncoderQwen25(nn.Module):
     """Static vision encoder for Qwen2.5-VL.
 
-    Pre-computes position embeddings, window indices, and cu_seqlens at init
-    for a fixed image size. Handles windowed attention with selective full
-    attention on fullatt_block_indexes.
+    Re-implements the vision attention to use pre-computed boolean masks
+    instead of cu_seqlens splitting, which torch.export cannot trace.
+    Window attention blocks get a block-diagonal mask; full attention
+    blocks get an all-True mask.
     """
 
     def __init__(
@@ -614,7 +615,6 @@ class StaticVisionEncoderQwen25(nn.Module):
     ) -> None:
         super().__init__()
         from transformers.vision_utils import (
-            get_vision_cu_seqlens,
             get_vision_position_ids,
             get_vision_window_index,
         )
@@ -633,9 +633,8 @@ class StaticVisionEncoderQwen25(nn.Module):
         self.spatial_merge_unit = merge ** 2
 
         self.patch_embed = visual_model.patch_embed
-        self.blocks = visual_model.blocks
         self.merger = visual_model.merger
-        self.fullatt_block_indexes = visual_model.fullatt_block_indexes
+        self.fullatt_block_indexes = set(visual_model.fullatt_block_indexes)
 
         grid_thw = torch.tensor([[self.grid_t, grid_h, grid_w]], dtype=torch.int32)
 
@@ -644,9 +643,6 @@ class StaticVisionEncoderQwen25(nn.Module):
 
         seq_len = self.num_patches
         smu = self.spatial_merge_unit
-        rotary_pos_emb = rotary_pos_emb.reshape(
-            seq_len // smu, smu, -1
-        )
 
         window_index, cu_window_seqlens = get_vision_window_index(
             grid_thw,
@@ -654,20 +650,80 @@ class StaticVisionEncoderQwen25(nn.Module):
             window_size=visual_model.window_size,
             patch_size=patch_size,
         )
-        cu_seqlens = get_vision_cu_seqlens(grid_thw)
 
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len // smu, smu, -1)
         rotary_pos_emb = rotary_pos_emb[window_index, :, :]
         rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
 
         self.register_buffer("rot_cos", emb.cos())
         self.register_buffer("rot_sin", emb.sin())
-        self.register_buffer("cu_seqlens", cu_seqlens)
-        self.register_buffer("cu_window_seqlens", cu_window_seqlens)
         self.register_buffer("window_index", window_index)
-        self.register_buffer(
-            "reverse_indices", torch.argsort(window_index)
+        self.register_buffer("reverse_indices", torch.argsort(window_index))
+
+        window_mask = self._build_block_diagonal_mask(cu_window_seqlens, seq_len)
+        full_mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
+        self.register_buffer("window_mask", window_mask)
+        self.register_buffer("full_mask", full_mask)
+
+        self.attn_layers = nn.ModuleList()
+        self.norm1_layers = nn.ModuleList()
+        self.norm2_layers = nn.ModuleList()
+        self.mlp_layers = nn.ModuleList()
+        for blk in visual_model.blocks:
+            self.attn_layers.append(blk.attn)
+            self.norm1_layers.append(blk.norm1)
+            self.norm2_layers.append(blk.norm2)
+            self.mlp_layers.append(blk.mlp)
+        self.num_heads = visual_model.blocks[0].attn.num_heads
+
+    @staticmethod
+    def _build_block_diagonal_mask(
+        cu_seqlens: torch.Tensor, seq_len: int
+    ) -> torch.Tensor:
+        mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+        starts = cu_seqlens[:-1].tolist()
+        ends = cu_seqlens[1:].tolist()
+        for s, e in zip(starts, ends, strict=True):
+            mask[s:e, s:e] = True
+        return mask
+
+    def _vision_attention(
+        self,
+        attn_module,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            apply_rotary_pos_emb_vision,
         )
+
+        seq_length = hidden_states.shape[0]
+        qkv = (
+            attn_module.qkv(hidden_states)
+            .reshape(seq_length, 3, self.num_heads, -1)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        query, key, value = qkv
+
+        query, key = apply_rotary_pos_emb_vision(
+            query, key, cos, sin
+        )
+
+        query = query.transpose(0, 1).unsqueeze(0)
+        key = key.transpose(0, 1).unsqueeze(0)
+        value = value.transpose(0, 1).unsqueeze(0)
+
+        attn_mask = mask.unsqueeze(0).unsqueeze(0)
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=attn_mask
+        )
+        out = out.squeeze(0).transpose(0, 1).reshape(seq_length, -1).contiguous()
+        return attn_module.proj(out)
 
     def _patchify(self, pixel_values: torch.Tensor) -> torch.Tensor:
         _, c, hw, _ = pixel_values.shape
@@ -705,19 +761,27 @@ class StaticVisionEncoderQwen25(nn.Module):
         hidden_states = hidden_states[self.window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
 
-        position_embeddings = (self.rot_cos, self.rot_sin)
+        cos = self.rot_cos.unsqueeze(-2)
+        sin = self.rot_sin.unsqueeze(-2)
 
-        for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
-                cu_seqlens_now = self.cu_seqlens
-            else:
-                cu_seqlens_now = self.cu_window_seqlens
-
-            hidden_states = blk(
-                hidden_states,
-                cu_seqlens=cu_seqlens_now,
-                position_embeddings=position_embeddings,
+        for layer_num in range(len(self.attn_layers)):
+            mask = (
+                self.full_mask
+                if layer_num in self.fullatt_block_indexes
+                else self.window_mask
             )
+
+            residual = hidden_states
+            hidden_states = self.norm1_layers[layer_num](hidden_states)
+            hidden_states = self._vision_attention(
+                self.attn_layers[layer_num], hidden_states, mask, cos, sin
+            )
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = self.norm2_layers[layer_num](hidden_states)
+            hidden_states = self.mlp_layers[layer_num](hidden_states)
+            hidden_states = residual + hidden_states
 
         merged = self.merger(hidden_states)
         if isinstance(merged, tuple):
