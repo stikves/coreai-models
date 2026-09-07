@@ -43,6 +43,9 @@ from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
 # Core AI state names for the persistent KV cache.
 KV_STATE_NAMES = ("k_cache", "v_cache")
 
+# Models that use the Gemma3n export path (3-input text decoder).
+_GEMMA3N_MODELS = {"gemma-3n-vl"}
+
 
 @dataclass(frozen=True)
 class VLMSpec:
@@ -89,6 +92,19 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         rescale_factor=1.0,
         image_strategy="stretch",
         include_image_info=True,
+    ),
+    "gemma-3n-vl": VLMSpec(
+        short_name="gemma-3n-vl",
+        hf_model_id="google/gemma-3n-E4B-it",
+        output_name="gemma3n_e4b_vl",
+        image_token_id=262145,  # <image_soft_token>
+        image_size=224,
+        patch_size=14,  # 224/14=16 grid → 16×16=256 tokens
+        spatial_merge_size=1,
+        temporal_patch_size=1,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0 / 255.0,
     ),
 }
 
@@ -745,6 +761,229 @@ async def export_vision_encoder(
 
 
 # ---------------------------------------------------------------------------
+# Gemma 3n: text decoder + vision encoder
+# ---------------------------------------------------------------------------
+
+
+async def export_gemma3n_text_bundle(
+    spec: VLMSpec,
+    *,
+    max_ctx: int,
+    num_layers: int | None,
+    output_dir: Path,
+    overwrite: bool,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> Path:
+    """Export Gemma 3n VLM text bundle (3-input decoder: input_ids + inputs_embeds + position_ids)."""
+    from coreai_models.models.macos.gemma3n_vlm import Gemma3nForCausalLMEmbeddings
+
+    output_name = spec.output_name
+
+    logging.info(f"Downloading {spec.hf_model_id}...")
+    model_dir = snapshot_download(
+        spec.hf_model_id,
+        allow_patterns=[
+            "*.safetensors",
+            "*.safetensors.index.json",
+            "config.json",
+            "tokenizer*",
+            "vocab.json",
+            "merges.txt",
+            "*.model",
+        ],
+    )
+    raw_cfg = AutoConfig.from_pretrained(model_dir)
+    text_cfg = raw_cfg.text_config
+    hidden_size = text_cfg.hidden_size
+    vocab_size = text_cfg.vocab_size
+    logging.info(f"Text config: hidden={hidden_size}, vocab={vocab_size}, ctx={max_ctx}")
+
+    logging.info("Loading Gemma3n text decoder from safetensors...")
+    model = load_model_from_safetensors(
+        model_class=Gemma3nForCausalLMEmbeddings,
+        hf_config=raw_cfg,
+        model_dir=model_dir,
+        max_ctx=max_ctx,
+        num_layers=num_layers,
+        dtype=torch.float16,
+    )
+    model = model.eval()
+    logging.info("Model loaded.")
+
+    QUERY_LEN = 64
+    OFFSET = 64
+    input_ids = torch.zeros(1, QUERY_LEN, dtype=torch.int32)
+    inputs_embeds = torch.randn(1, QUERY_LEN, hidden_size, dtype=torch.float16)
+    position_ids = torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0)
+
+    n_layers = num_layers or text_cfg.num_hidden_layers
+    n_kv_heads = text_cfg.num_key_value_heads
+    head_dim = getattr(text_cfg, "head_dim", hidden_size // text_cfg.num_attention_heads)
+    # Gemma3n uses compact KV cache slots (shared layers reuse slots)
+    num_cache_slots = model.model.num_cache_slots
+    k_cache = torch.zeros(num_cache_slots, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+    v_cache = torch.zeros(num_cache_slots, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+
+    reference_inputs = {
+        "input_ids": input_ids,
+        "inputs_embeds": inputs_embeds,
+        "position_ids": position_ids,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+    }
+    seq_dim = torch.export.Dim("query_len", max=max_ctx - 2)
+    dynamic_shapes = {
+        "input_ids": {1: seq_dim},
+        "inputs_embeds": {1: seq_dim},
+        "position_ids": {1: torch.export.Dim("seq_pos", min=QUERY_LEN, max=max_ctx - 1)},
+        "k_cache": None,
+        "v_cache": None,
+    }
+
+    logging.info("Exporting Gemma3n text decoder (3-input: input_ids + inputs_embeds + position_ids)...")
+    program = export_to_coreai(
+        model,
+        reference_inputs,
+        dynamic_shapes=dynamic_shapes,
+        input_names=("input_ids", "inputs_embeds", "position_ids"),
+        output_names=("logits",),
+        state_names=KV_STATE_NAMES,
+        include_debug_info=include_debug_info,
+    )
+    logging.info("Optimizing AIProgram...")
+    program.optimize()
+
+    bundle_path = output_dir / output_name
+    bundle_path.mkdir(parents=True, exist_ok=True)
+    aimodel_path = bundle_path / f"{output_name}.aimodel"
+
+    if aimodel_path.exists() and not overwrite:
+        raise FileExistsError(f"{aimodel_path} exists. Use --overwrite.")
+    elif aimodel_path.exists():
+        shutil.rmtree(aimodel_path)
+
+    logging.info(f"Saving model to {aimodel_path}...")
+    meta = build_aimodel_metadata(spec.hf_model_id)
+    await asyncio.to_thread(program.save_asset, aimodel_path, meta)
+    del model
+
+    logging.info("Exporting embed.aimodel...")
+    embed_rel = await export_embed_model(
+        spec, bundle_path, model_dir, max_ctx, overwrite, include_debug_info=include_debug_info
+    )
+
+    logging.info("Saving tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer.save_pretrained(str(bundle_path / "tokenizer"))
+
+    metadata = {
+        "metadata_version": "0.2",
+        "kind": "vlm",
+        "name": output_name,
+        "assets": {
+            "main": f"{output_name}.aimodel",
+            "embedding": embed_rel,
+        },
+        "language": {
+            "tokenizer": spec.hf_model_id,
+            "vocab_size": vocab_size,
+            "max_context_length": max_ctx,
+            "embedded_tokenizer": True,
+            "function_map": {"main": ["main"]},
+        },
+        "vision": {
+            "image_size": spec.image_size,
+            "patch_size": spec.patch_size,
+            "image_token_count": spec.num_visual_tokens,
+            "image_token_id": spec.image_token_id,
+            "image_mean": list(spec.image_mean),
+            "image_std": list(spec.image_std),
+            "rescale_factor": spec.rescale_factor,
+            "image_strategy": spec.image_strategy,
+        },
+        "source": {
+            "hf_model_id": spec.hf_model_id,
+            "model_definition": "torch",
+        },
+    }
+    with open(bundle_path / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logging.info(f"Text bundle complete: {bundle_path}")
+    return bundle_path
+
+
+async def export_gemma3n_vision_encoder(
+    spec: VLMSpec,
+    bundle_path: Path,
+    overwrite: bool,
+    include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
+) -> str:
+    """Export the Gemma3n MobileNetV5 vision encoder as vision.aimodel."""
+    from transformers import Gemma3nForConditionalGeneration
+
+    from coreai_models.models.macos.gemma3n_vlm import Gemma3nVisionEncoder
+
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
+
+    logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
+    hf_model = Gemma3nForConditionalGeneration.from_pretrained(
+        spec.hf_model_id, torch_dtype=torch.float32
+    )
+    hf_model = hf_model.eval()
+
+    text_hidden = hf_model.config.text_config.hidden_size
+
+    wrapper = Gemma3nVisionEncoder(
+        vision_tower=hf_model.model.vision_tower,
+        embedder=hf_model.model.embed_vision,
+        hidden_size=text_hidden,
+    ).eval()
+    del hf_model
+
+    pixel_shape = (1, 3, spec.image_size, spec.image_size)
+    with torch.no_grad():
+        test_out = wrapper(torch.randn(*pixel_shape, dtype=torch.float32))
+        logging.info(f"Vision encoder output {tuple(test_out.shape)}; expected [1, 256, {text_hidden}]")
+
+    export_module = BatchedF16VisionEncoder(wrapper).eval()
+
+    reference_inputs = {"pixel_values": torch.randn(*pixel_shape, dtype=torch.float32)}
+
+    logging.info(f"Exporting Gemma3n vision encoder (MobileNetV5, {spec.image_size}×{spec.image_size})...")
+    program = export_to_coreai(
+        export_module,
+        reference_inputs,
+        dynamic_shapes=None,
+        input_names=("pixel_values",),
+        output_names=("image_features",),
+        include_debug_info=include_debug_info,
+    )
+    logging.info("Optimizing AIProgram...")
+    program.optimize()
+
+    vision_path = bundle_path / "vision.aimodel"
+    if vision_path.exists() and not overwrite:
+        raise FileExistsError(f"{vision_path} exists. Use --overwrite.")
+    elif vision_path.exists():
+        shutil.rmtree(vision_path)
+
+    logging.info(f"Saving to {vision_path}...")
+    build_meta = build_aimodel_metadata(spec.hf_model_id)
+    await asyncio.to_thread(program.save_asset, vision_path, build_meta)
+
+    with open(bundle_path / "metadata.json") as f:
+        metadata = json.load(f)
+    metadata["assets"]["vision"] = "vision.aimodel"
+    with open(bundle_path / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    logging.info("Updated metadata.json with vision asset")
+    return "vision.aimodel"
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -835,23 +1074,42 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run(spec: VLMSpec, args: argparse.Namespace) -> Path:
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir()
-    bundle_path = await export_text_bundle(
-        spec,
-        max_ctx=args.max_context_length,
-        num_layers=args.num_layers,
-        output_dir=output_dir,
-        overwrite=args.overwrite,
-        include_debug_info=args.include_debug_info,
-    )
-    if not args.skip_vision:
-        logging.info("Exporting vision encoder...")
-        await export_vision_encoder(
+
+    if spec.short_name in _GEMMA3N_MODELS:
+        bundle_path = await export_gemma3n_text_bundle(
             spec,
-            bundle_path,
-            args.overwrite,
-            args.num_frames,
+            max_ctx=args.max_context_length,
+            num_layers=args.num_layers,
+            output_dir=output_dir,
+            overwrite=args.overwrite,
             include_debug_info=args.include_debug_info,
         )
+        if not args.skip_vision:
+            logging.info("Exporting Gemma3n vision encoder...")
+            await export_gemma3n_vision_encoder(
+                spec,
+                bundle_path,
+                args.overwrite,
+                include_debug_info=args.include_debug_info,
+            )
+    else:
+        bundle_path = await export_text_bundle(
+            spec,
+            max_ctx=args.max_context_length,
+            num_layers=args.num_layers,
+            output_dir=output_dir,
+            overwrite=args.overwrite,
+            include_debug_info=args.include_debug_info,
+        )
+        if not args.skip_vision:
+            logging.info("Exporting vision encoder...")
+            await export_vision_encoder(
+                spec,
+                bundle_path,
+                args.overwrite,
+                args.num_frames,
+                include_debug_info=args.include_debug_info,
+            )
     return bundle_path
 
 
