@@ -125,6 +125,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.muse_glimmer_drafter_ring import MuseGlimmerDrafterForCausalLM
     from coreai_models.models.macos.phi3 import Phi3ForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
+    from coreai_models.models.macos.qwen2_5_vl import Qwen2_5VLForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
     from coreai_models.models.macos.qwen3_vl import (
@@ -168,6 +169,11 @@ def _get_registry() -> dict[str, ModelEntry]:
         "qwen2": ModelEntry(
             macos_class=Qwen2ForCausalLM,
             ios_class=Qwen2ForCausalLMForiOS,
+        ),
+        "qwen2_5_vl": ModelEntry(
+            macos_class=Qwen2_5VLForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
         ),
         "qwen3": ModelEntry(
             macos_class=Qwen3ForCausalLM,
