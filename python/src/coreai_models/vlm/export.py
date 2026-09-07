@@ -761,8 +761,8 @@ class StaticVisionEncoderQwen25(nn.Module):
         hidden_states = hidden_states[self.window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
 
-        cos = self.rot_cos.unsqueeze(-2)
-        sin = self.rot_sin.unsqueeze(-2)
+        cos = self.rot_cos
+        sin = self.rot_sin
 
         for layer_num in range(len(self.attn_layers)):
             mask = (
