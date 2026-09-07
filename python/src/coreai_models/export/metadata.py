@@ -169,6 +169,24 @@ _METADATA: dict[str, AIModelMetadataFields] = {
         ),
     ),
     # ---- VLMs ----
+    "Qwen/Qwen2.5-VL-7B-Instruct": AIModelMetadataFields(
+        author="Qwen Team",
+        license="Apache-2.0",
+        model_description=(
+            "Qwen2.5-VL-7B-Instruct is a 7B-parameter instruction-tuned "
+            "vision-language model from the Qwen2.5-VL family. "
+            "Source: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct"
+        ),
+    ),
+    "allenai/olmOCR-2-7B-1025": AIModelMetadataFields(
+        author="Allen Institute for AI",
+        license="Apache-2.0",
+        model_description=(
+            "olmOCR-2 7B is a document understanding model fine-tuned from "
+            "Qwen2.5-VL-7B for PDF-to-Markdown extraction. "
+            "Source: https://huggingface.co/allenai/olmOCR-2-7B-1025"
+        ),
+    ),
     "Qwen/Qwen3-VL-2B-Instruct": AIModelMetadataFields(
         author="Qwen Team",
         license="Apache-2.0",

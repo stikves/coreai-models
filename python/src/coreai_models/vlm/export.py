@@ -38,6 +38,7 @@ from transformers import AutoConfig, AutoTokenizer
 from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
+from coreai_models.models.macos.qwen2_5_vl import Qwen2_5VLForCausalLMEmbeddings
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
 
 # Core AI state names for the persistent KV cache.
@@ -89,6 +90,35 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         rescale_factor=1.0,
         image_strategy="stretch",
         include_image_info=True,
+    ),
+    "qwen2.5-vl-7b": VLMSpec(
+        short_name="qwen2.5-vl-7b",
+        hf_model_id="Qwen/Qwen2.5-VL-7B-Instruct",
+        output_name="qwen2_5_vl_7b",
+        image_token_id=151655,
+        image_size=448,
+        patch_size=14,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        include_image_info=True,
+    ),
+    "olmocr-7b": VLMSpec(
+        short_name="olmocr-7b",
+        hf_model_id="allenai/olmOCR-2-7B-1025",
+        output_name="olmocr_7b",
+        image_token_id=151655,
+        image_size=448,
+        patch_size=14,
+        spatial_merge_size=2,
+        temporal_patch_size=2,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
     ),
 }
 
@@ -289,9 +319,14 @@ async def export_text_bundle(
     logging.info(f"Text config: hidden={hidden_size}, vocab={vocab_size}, ctx={max_ctx}")
 
     # ---- 2. Load model directly from safetensors ----
+    _QWEN25_VL_SPECS = ("qwen2.5-vl-7b", "olmocr-7b")
+    if spec.short_name in _QWEN25_VL_SPECS:
+        model_class = Qwen2_5VLForCausalLMEmbeddings
+    else:
+        model_class = Qwen3VLForCausalLMEmbeddings
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
     model = load_model_from_safetensors(
-        model_class=Qwen3VLForCausalLMEmbeddings,
+        model_class=model_class,
         hf_config=raw_cfg,
         model_dir=model_dir,
         max_ctx=max_ctx,
@@ -535,6 +570,137 @@ class StaticVisionEncoder(nn.Module):
         return self.merger(hidden_states)
 
 
+class StaticVisionEncoderQwen25(nn.Module):
+    """Static vision encoder for Qwen2.5-VL.
+
+    Pre-computes position embeddings, window indices, and cu_seqlens at init
+    for a fixed image size. Handles windowed attention with selective full
+    attention on fullatt_block_indexes.
+    """
+
+    def __init__(
+        self,
+        visual_model,
+        *,
+        image_size: int,
+        patch_size: int,
+        spatial_merge_size: int,
+        temporal_patch_size: int,
+        num_frames: int = 1,
+    ) -> None:
+        super().__init__()
+        from transformers.vision_utils import (
+            get_vision_cu_seqlens,
+            get_vision_position_ids,
+            get_vision_window_index,
+        )
+
+        merge = spatial_merge_size
+        hw = image_size
+        c = 3
+
+        grid_h = hw // patch_size
+        grid_w = hw // patch_size
+        self.grid_t = max(num_frames // temporal_patch_size, 1)
+        self.num_patches = self.grid_t * grid_h * grid_w
+        self.patch_dim = c * temporal_patch_size * patch_size * patch_size
+        self.num_frames = num_frames
+        self.temporal_patch_size = temporal_patch_size
+        self.spatial_merge_unit = merge ** 2
+
+        self.patch_embed = visual_model.patch_embed
+        self.blocks = visual_model.blocks
+        self.merger = visual_model.merger
+        self.fullatt_block_indexes = visual_model.fullatt_block_indexes
+
+        grid_thw = torch.tensor([[self.grid_t, grid_h, grid_w]], dtype=torch.int32)
+
+        position_ids = get_vision_position_ids(grid_thw, merge)
+        rotary_pos_emb = visual_model.rotary_pos_emb(position_ids)
+
+        seq_len = self.num_patches
+        smu = self.spatial_merge_unit
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // smu, smu, -1
+        )
+
+        window_index, cu_window_seqlens = get_vision_window_index(
+            grid_thw,
+            spatial_merge_size=merge,
+            window_size=visual_model.window_size,
+            patch_size=patch_size,
+        )
+        cu_seqlens = get_vision_cu_seqlens(grid_thw)
+
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+
+        self.register_buffer("rot_cos", emb.cos())
+        self.register_buffer("rot_sin", emb.sin())
+        self.register_buffer("cu_seqlens", cu_seqlens)
+        self.register_buffer("cu_window_seqlens", cu_window_seqlens)
+        self.register_buffer("window_index", window_index)
+        self.register_buffer(
+            "reverse_indices", torch.argsort(window_index)
+        )
+
+    def _patchify(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        _, c, hw, _ = pixel_values.shape
+        patch = self.patch_embed.proj.kernel_size[1]
+        merge = int(self.spatial_merge_unit ** 0.5)
+
+        if self.num_frames == 1:
+            x = pixel_values.expand(self.temporal_patch_size, c, hw, hw)
+        else:
+            x = pixel_values.reshape(self.num_frames, c, hw, hw)
+
+        grid_h = hw // patch
+        grid_w = hw // patch
+        x = x.reshape(
+            self.grid_t,
+            self.temporal_patch_size,
+            c,
+            grid_h // merge,
+            merge,
+            patch,
+            grid_w // merge,
+            merge,
+            patch,
+        )
+        x = x.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        return x.reshape(self.num_patches, self.patch_dim)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        patches = self._patchify(pixel_values)
+        hidden_states = self.patch_embed(patches)
+
+        seq_len = hidden_states.size(0)
+        smu = self.spatial_merge_unit
+        hidden_states = hidden_states.reshape(seq_len // smu, smu, -1)
+        hidden_states = hidden_states[self.window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        position_embeddings = (self.rot_cos, self.rot_sin)
+
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in self.fullatt_block_indexes:
+                cu_seqlens_now = self.cu_seqlens
+            else:
+                cu_seqlens_now = self.cu_window_seqlens
+
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                position_embeddings=position_embeddings,
+            )
+
+        merged = self.merger(hidden_states)
+        if isinstance(merged, tuple):
+            merged = merged[0]
+        return merged[self.reverse_indices, :]
+
+
 class BatchedF16VisionEncoder(nn.Module):
     """Conform the encoder output to the runner contract shared with embed/main.
 
@@ -626,14 +792,8 @@ async def export_vision_encoder(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> str:
     """Export the vision encoder as vision.aimodel and patch metadata.json."""
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLForConditionalGeneration as HFModel,
-    )
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-        Qwen3VLVisionModel,
-    )
-
-    _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
+    _QWEN25_VL_SPECS = ("qwen2.5-vl-7b", "olmocr-7b")
+    is_qwen25 = spec.short_name in _QWEN25_VL_SPECS
 
     if not bundle_path.exists():
         raise FileNotFoundError(f"Bundle not found: {bundle_path}. Export the text decoder first.")
@@ -643,18 +803,45 @@ async def export_vision_encoder(
 
     # ---- 2. Load HF model (vision part only) ----
     logging.info(f"Loading {spec.hf_model_id} for vision encoder extraction...")
-    hf_model = HFModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
-    hf_model = hf_model.eval()
+    if is_qwen25:
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+            Qwen2_5_VLForConditionalGeneration as HFModel25,
+        )
 
-    wrapper = StaticVisionEncoder(
-        hf_model.model.visual,
-        image_size=spec.image_size,
-        patch_size=spec.patch_size,
-        spatial_merge_size=spec.spatial_merge_size,
-        temporal_patch_size=spec.temporal_patch_size,
-        num_frames=num_frames,
-    ).eval()
-    del hf_model
+        hf_model = HFModel25.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = hf_model.eval()
+
+        wrapper = StaticVisionEncoderQwen25(
+            hf_model.model.visual,
+            image_size=spec.image_size,
+            patch_size=spec.patch_size,
+            spatial_merge_size=spec.spatial_merge_size,
+            temporal_patch_size=spec.temporal_patch_size,
+            num_frames=num_frames,
+        ).eval()
+        del hf_model
+    else:
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLForConditionalGeneration as HFModel3,
+        )
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLVisionModel,
+        )
+
+        _patch_fast_pos_embed_interpolate(Qwen3VLVisionModel)
+
+        hf_model = HFModel3.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        hf_model = hf_model.eval()
+
+        wrapper = StaticVisionEncoder(
+            hf_model.model.visual,
+            image_size=spec.image_size,
+            patch_size=spec.patch_size,
+            spatial_merge_size=spec.spatial_merge_size,
+            temporal_patch_size=spec.temporal_patch_size,
+            num_frames=num_frames,
+        ).eval()
+        del hf_model
 
     grid_t = wrapper.grid_t
     num_visual_tokens = spec.num_visual_tokens * grid_t
