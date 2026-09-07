@@ -26,7 +26,7 @@ uv run export.py --help
 
 | Flag               | Description                                    | Default                       |
 | ------------------ | ---------------------------------------------- | ----------------------------- |
-| `--model`          | Model variant                                  | `nvidia/parakeet-tdt-0.6b-v3` |
+| `--model`          | HuggingFace model ID (see table below)         | `nvidia/parakeet-tdt-0.6b-v3` |
 | `--output-dir`     | Output directory for the bundle                | `<repo-root>/exports/`        |
 | `--dtype`          | `float16`, `float32`                           | `float32`                     |
 | `--dynamic`        | Encoder accepts variable audio length          | static (5s default)           |
@@ -36,9 +36,11 @@ uv run export.py --help
 
 **Supported models:**
 
-| Model                         | Parameters |
-| ----------------------------- | ---------- |
-| nvidia/parakeet-tdt-0.6b-v3   | 0.6B       |
+| Model                         | Parameters | Notes |
+| ----------------------------- | ---------- | ----- |
+| nvidia/parakeet-tdt-0.6b-v3   | 0.6B       | Multilingual (default) |
+
+Any Parakeet TDT checkpoint in HuggingFace `transformers` format can be exported by passing its model ID with `--experimental`. The export reads vocab size, durations, and encoder geometry from the checkpoint config, so alternative checkpoints can be experimented with without code changes.
 
 ## Running
 

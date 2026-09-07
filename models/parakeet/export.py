@@ -362,23 +362,23 @@ def _bundle_paths(
     return bundle_dir, assets
 
 
-def _build_aimodel_metadata(graph: str) -> AIModelAssetMetadata:
+def _build_aimodel_metadata(graph: str, model_name: str) -> AIModelAssetMetadata:
     metadata = AIModelAssetMetadata()
     metadata.author = "M. Sekoyan et al."
     metadata.license = "CC-BY-4.0"
     metadata.model_description = (
-        f"Parakeet-TDT v3 ASR ({graph} subgraph). Parakeet is a FastConformer "
+        f"Parakeet-TDT ASR ({graph} subgraph). Parakeet is a FastConformer "
         f"encoder paired with a Token-and-Duration Transducer decoder that "
         f"predicts (token, duration) pairs for blank-skipping greedy decoding. "
-        f"Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
+        f"Source: https://huggingface.co/{model_name}"
     )
     metadata.creation_date = int(time.time())
     return metadata
 
 
-def _save_program(program, model_path: Path, graph: str) -> None:
+def _save_program(program, model_path: Path, graph: str, model_name: str) -> None:
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    program.save_asset(model_path, _build_aimodel_metadata(graph))
+    program.save_asset(model_path, _build_aimodel_metadata(graph, model_name))
     print(f"[INFO] Saved {graph} graph to {model_path}.")
 
 
@@ -548,7 +548,7 @@ def create_parakeet(
         include_debug_info=include_debug_info,
         dynamic_shapes=_encoder_dynamic_shapes() if dynamic else None,
     )
-    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH)
+    _save_program(encoder_program, assets[ENCODER_GRAPH], ENCODER_GRAPH, model_name)
 
     print(f"[INFO] Exporting {DECODER_STEP_GRAPH} graph...")
     decoder_program = _convert(
@@ -559,7 +559,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH)
+    _save_program(decoder_program, assets[DECODER_STEP_GRAPH], DECODER_STEP_GRAPH, model_name)
 
     print(f"[INFO] Exporting {JOINT_GRAPH} graph...")
     joint_program = _convert(
@@ -570,7 +570,7 @@ def create_parakeet(
         dtype=dtype,
         include_debug_info=include_debug_info,
     )
-    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH)
+    _save_program(joint_program, assets[JOINT_GRAPH], JOINT_GRAPH, model_name)
 
     _write_processor(bundle_dir / "processor", processor, model_name)
     _write_bundle_metadata(
@@ -629,9 +629,12 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["nvidia/parakeet-tdt-0.6b-v3"],
         default="nvidia/parakeet-tdt-0.6b-v3",
-        help="Model variant to convert.",
+        help=(
+            "HuggingFace model ID. Tested: nvidia/parakeet-tdt-0.6b-v3. "
+            "Other Parakeet TDT checkpoints in HF format may work but are not "
+            "officially validated."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -709,7 +712,21 @@ def main():
         help="Embed debug information in the exported .aimodel for debugging a conversion. "
         "Default: off, which embeds minimum debug information and makes the exported asset smaller.",
     )
+    parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help="Allow exporting models outside the tested set.",
+    )
     args = parser.parse_args()
+
+    _TESTED_MODELS = {"nvidia/parakeet-tdt-0.6b-v3"}
+    if args.model not in _TESTED_MODELS and not args.experimental:
+        raise SystemExit(
+            f"Error: '{args.model}' is not a tested model. "
+            f"Pass --experimental to try it anyway.\n"
+            f"See models/parakeet/README.md for supported models."
+        )
+
     _warn_ignored_shape_args(parser, args)
 
     dtype = {
