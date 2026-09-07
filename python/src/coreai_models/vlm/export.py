@@ -157,6 +157,13 @@ def load_model_from_safetensors(
         model.language_model.layers.N.self_attn.q_proj.weight  (etc.)
         model.language_model.norm.weight
         model.visual.*  (skipped)
+
+    The HF Qwen2.5-VL checkpoint structure (no language_model prefix):
+        model.embed_tokens.weight
+        model.layers.N.self_attn.q_proj.weight  (etc.)
+        model.norm.weight
+        lm_head.weight
+        visual.*  (skipped)
     """
     # Set config
     text_cfg = model_class._get_reauthored_config(hf_config, max_ctx, num_layers)
@@ -166,22 +173,38 @@ def load_model_from_safetensors(
     model.to(dtype=dtype)
 
     # Build state dict from safetensors
-    prefix = "model.language_model."
+    # Auto-detect prefix: Qwen3-VL uses "model.language_model.", Qwen2.5-VL uses "model."
     layer_pattern = re.compile(r"layers\.(\d+)\.")
     st_files = _get_safetensors_files(model_dir)
+
+    # Probe first shard to detect key layout
+    with safe_open(st_files[0], framework="pt", device="cpu") as f:
+        sample_keys = list(f.keys())[:50]
+    has_language_model_prefix = any(k.startswith("model.language_model.") for k in sample_keys)
+
+    if has_language_model_prefix:
+        text_prefix = "model.language_model."
+        vision_prefixes = ("model.visual.",)
+    else:
+        text_prefix = "model."
+        vision_prefixes = ("visual.",)
 
     state_dict: dict[str, torch.Tensor] = {}
     for path in st_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118 — safe_open has no __iter__/__contains__
-                if key.startswith("model.visual."):
+                if any(key.startswith(vp) for vp in vision_prefixes):
                     continue
-                if not key.startswith(prefix):
+                if key == "lm_head.weight":
+                    tensor = f.get_tensor(key)
+                    if tensor.dtype not in (torch.float16, torch.int8):
+                        tensor = tensor.to(dtype)
+                    state_dict["lm_head.weight"] = tensor
                     continue
-                # Strip "model.language_model." → add "model."
-                # "model.language_model.layers.0.self_attn.q_proj.weight" → "model.layers.0.*"
-                stripped = key[len(prefix) :]  # e.g. "layers.0.self_attn.q_proj.weight"
-                model_key = "model." + stripped  # e.g. "model.layers.0.self_attn.q_proj.weight"
+                if not key.startswith(text_prefix):
+                    continue
+                stripped = key[len(text_prefix):]
+                model_key = "model." + stripped
                 # Skip layers beyond num_layers
                 m = layer_pattern.match(stripped)
                 if m and num_layers is not None and int(m.group(1)) >= num_layers:
@@ -231,12 +254,13 @@ class EmbedTokens(torch.nn.Module):
 
 def _load_embed_weight(model_dir: str) -> torch.Tensor:
     """Read the f16 embed_tokens weight table [vocab, hidden] from safetensors."""
-    embed_key = "model.language_model.embed_tokens.weight"
+    embed_keys = ["model.language_model.embed_tokens.weight", "model.embed_tokens.weight"]
     for path in _get_safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as f:
-            if embed_key in f.keys():  # noqa: SIM118 — safe_open has no __contains__
-                return f.get_tensor(embed_key).to(torch.float16)
-    raise RuntimeError(f"embed_tokens not found in safetensors (looked for '{embed_key}')")
+            for embed_key in embed_keys:
+                if embed_key in f.keys():  # noqa: SIM118 — safe_open has no __contains__
+                    return f.get_tensor(embed_key).to(torch.float16)
+    raise RuntimeError(f"embed_tokens not found in safetensors (looked for {embed_keys})")
 
 
 async def export_embed_model(
