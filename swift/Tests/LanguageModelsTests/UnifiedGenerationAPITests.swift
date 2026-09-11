@@ -747,10 +747,89 @@ struct PrefixCachingTests {
         }
 
         // The clamp must cap the prefix to processedTokenCount (5), not history.count (6).
-        // Without the clamp, lastPrefixHitCount would be 6 and token 30 would be skipped.
-        #expect(engine.lastPrefixHitCount <= 6)
+        #expect(engine.lastPrefixHitCount == 5)
         // processedTokenCount should account for: 5 (carried) + 3 (token 30 + two user) + 2 (generated) = 10
         #expect(engine.processedTokenCount == 10)
+    }
+
+    @Test("five-turn prefix caching with pipelined gap stays consistent")
+    func fiveTurnPrefixCachingWithPipelinedGap() async throws {
+        let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 2000)
+
+        var context: [Int32] = [1, 2, 3]
+
+        for turn in 1...5 {
+            // Append user tokens for each turn beyond the first
+            if turn > 1 {
+                context.append(contentsOf: [Int32(turn * 100 + 1), Int32(turn * 100 + 2)])
+            }
+
+            let preGenProcessed = engine.processedTokenCount
+            for try await output in try await engine.generate(
+                with: context,
+                samplingConfiguration: .greedy,
+                inferenceOptions: InferenceOptions(maxTokens: 2)
+            ) {
+                context.append(output.tokenId)
+            }
+
+            // Simulate pipelined gap: last token yielded but not processed.
+            engine.processedTokenCount -= 1
+
+            // History must mirror context (no duplicates from missing truncation).
+            #expect(
+                engine.history.tokens.count == context.count,
+                "Turn \(turn): history (\(engine.history.tokens.count)) drifted from context (\(context.count))"
+            )
+
+            // Prefix hit should reuse all prior KV-valid tokens, not trigger divergence.
+            if turn > 1 {
+                #expect(
+                    engine.lastPrefixHitCount == preGenProcessed,
+                    "Turn \(turn): expected prefix hit \(preGenProcessed), got \(engine.lastPrefixHitCount)"
+                )
+            }
+        }
+    }
+
+    @Test("prefix clamp handles a multi-token pipelined gap (cancellation / early-EOS)")
+    func multiTurnPrefixClampWithLargerPipelinedGap() async throws {
+        let engine = MockEngine(tokens: [10, 20, 30, 40, 50], maxContextLength: 200)
+
+        // Turn 1: prompt [1, 2, 3], generate 5 tokens.
+        var context: [Int32] = [1, 2, 3]
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 5)
+        ) {
+            context.append(output.tokenId)
+        }
+        // context = [1, 2, 3, 10, 20, 30, 40, 50], history.count = 8, processedTokenCount = 8
+        #expect(context.count == 8)
+
+        // A cancellation/early-EOS drain can leave more than one trailing token
+        // yielded but never fed back through the model. Simulate a gap of three.
+        engine.processedTokenCount -= 3
+        // Now: history.count = 8, processedTokenCount = 5 (positions 5, 6, 7 lack KV)
+
+        // Turn 2: append new user tokens, generate again.
+        context.append(contentsOf: [77, 78])
+        for try await output in try await engine.generate(
+            with: context,
+            samplingConfiguration: .greedy,
+            inferenceOptions: InferenceOptions(maxTokens: 2)
+        ) {
+            context.append(output.tokenId)
+        }
+
+        // The clamp caps the prefix to processedTokenCount (5), re-prefilling
+        // 30, 40, 50, 77, 78 — regardless of how many tokens the gap spans.
+        #expect(engine.lastPrefixHitCount == 5)
+        // History must mirror context exactly — no duplicated trailing tokens.
+        #expect(engine.history.tokens.count == context.count)
+        // processedTokenCount: 5 (carried) + 5 (re-prefill) + 2 (generated) = 12
+        #expect(engine.processedTokenCount == 12)
     }
 }
 
