@@ -46,16 +46,27 @@ class DecomposedRoPE(torch.nn.Module):
       y1 = cos * x1 - sin * x2
       y2 = sin * x1 + cos * x2
       output = cat(y1, y2, passthrough)
+
+    ``inv_freq`` and ``attention_scale`` let this reproduce a scaled RoPE
+    variant (e.g. LongRoPE) with raw ops: pass precomputed per-dimension
+    inverse frequencies and the attention factor that scales the rotary
+    dims before rotation. See :meth:`LongRoPE.to_decomposed`.
     """
 
     def __init__(
         self: Self,
         dims: int | None = None,
         base: float = 1e4,
+        inv_freq: torch.Tensor | None = None,
+        attention_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.dims = dims
         self.base = base
+        # Stored as a plain attribute (like LongRoPE._freqs) so it stays a
+        # constant under torch.export; moved onto the input device in forward.
+        self._inv_freq = inv_freq
+        self.attention_scale = attention_scale
 
     def forward(
         self: Self,
@@ -95,9 +106,13 @@ class DecomposedRoPE(torch.nn.Module):
 
         pos = pos.float()
 
-        # Compute inverse frequencies in f32: 1 / (base ^ (i / half_dim))
-        exponent = torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
-        inv_freq = 1.0 / torch.pow(self.base, exponent)
+        # Inverse frequencies in f32. Use the precomputed per-dimension freqs
+        # when provided (e.g. LongRoPE), else the plain 1/base^(i/half_dim).
+        if self._inv_freq is not None:
+            inv_freq = self._inv_freq.to(device=input.device, dtype=torch.float32)
+        else:
+            exponent = torch.arange(half_dim, dtype=torch.float32, device=input.device) / half_dim
+            inv_freq = 1.0 / torch.pow(self.base, exponent)
 
         # Compute angles: (batch, 1, seq_len, 1) * (half_dim,) -> (batch, 1, seq_len, half_dim)
         angle = pos.unsqueeze(-1) * inv_freq
@@ -109,6 +124,12 @@ class DecomposedRoPE(torch.nn.Module):
         # Split input into two halves (non-interleaved)
         x1 = input[..., :half_dim]
         x2 = input[..., half_dim:rotation_dims]
+
+        # Scale the rotary dims by the attention factor before rotation, matching
+        # LongRoPE (rotation is linear, so scaling the input scales the output).
+        if self.attention_scale != 1.0:
+            x1 = x1 * self.attention_scale
+            x2 = x2 * self.attention_scale
 
         # Apply rotation
         y1 = cos * x1 - sin * x2
@@ -271,6 +292,19 @@ class LongRoPE(torch.nn.Module):
             offset=offset,
         )
 
+    def to_decomposed(self: Self) -> "DecomposedRoPE":
+        """Return a raw-torch equivalent that avoids the composite RoPE op.
+
+        The composite op rejects partial-rotary frequency tensors on newer OS
+        betas. This carries the LongRoPE per-dimension frequencies and the
+        attention factor into DecomposedRoPE, preserving numerical behavior.
+        """
+        return DecomposedRoPE(
+            dims=self.dims,
+            inv_freq=self._freqs,
+            attention_scale=self.attention_factor,
+        )
+
 
 def initialize_rope(
     dims: int | None = None,
@@ -280,12 +314,14 @@ def initialize_rope(
     max_position_embeddings: int | None = None,
     original_max_position_embeddings: int | None = None,
     config_max_position_embeddings: int | None = None,
+    decomposed: bool = False,
 ) -> torch.nn.Module:
-    # When FORCE_DECOMPOSED_ROPE=1, bypass the composite op entirely and use
-    # raw torch ops. This works around MLIR lowering bugs for partial rotary
-    # (similar to the FLUX.2 inline RoPE corruption: rdar://178555985).
-    if os.environ.get("FORCE_DECOMPOSED_ROPE") == "1":
-        return DecomposedRoPE(dims=dims, base=float(base))
+    # ``decomposed`` (or FORCE_DECOMPOSED_ROPE=1) emits the rotation with raw
+    # torch ops instead of the composite op, which the runtime mis-lowers for
+    # partial rotary embeddings on newer OS betas (rdar://178555985). The
+    # decomposed path preserves scaling: LongRoPE carries its per-dimension
+    # frequencies and attention factor across via LongRoPE.to_decomposed().
+    use_decomposed = decomposed or os.environ.get("FORCE_DECOMPOSED_ROPE") == "1"
 
     if scaling_config is not None:
         rope_type = scaling_config.get("type") or scaling_config.get("rope_type", "default")
@@ -352,5 +388,13 @@ def initialize_rope(
         case _:
             msg = f"Unsupported RoPE type {rope_type}"
             raise ValueError(msg)
+
+    if use_decomposed:
+        if isinstance(rope, LongRoPE):
+            return rope.to_decomposed()
+        if rope_type == "default":
+            return DecomposedRoPE(dims=dims, base=float(base))
+        msg = f"Decomposed RoPE is not supported for rope_type={rope_type!r}"
+        raise NotImplementedError(msg)
 
     return rope
