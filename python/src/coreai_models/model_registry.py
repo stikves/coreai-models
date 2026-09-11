@@ -401,7 +401,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "diffusion",
         None,
         "none",
-        "float16",
+        "float32",
         None,
     ),
     ModelPreset(
@@ -411,7 +411,7 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         "diffusion",
         None,
         "none",
-        "float16",
+        "float32",
         None,
     ),
     ModelPreset(
@@ -508,6 +508,13 @@ UTILITY_PRESETS: list[UtilityModel] = [
         "sam3",
         "segmentation",
         "models/sam3/export.py",
+    ),
+    UtilityModel(
+        "sam3-video",
+        "facebook/sam3",
+        "sam3_video",
+        "segmentation",
+        "models/sam3_video/export.py",
     ),
     # --- Depth ---
     UtilityModel(
