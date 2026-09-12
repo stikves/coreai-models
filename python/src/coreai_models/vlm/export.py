@@ -98,12 +98,14 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         hf_model_id="google/gemma-3n-E4B-it",
         output_name="gemma3n_e4b_vl",
         image_token_id=262145,  # <image_soft_token>
-        image_size=224,
-        patch_size=14,  # 224/14=16 grid → 16×16=256 tokens
+        image_size=768,
+        patch_size=48,  # 768/48=16 grid → 16×16=256 tokens (MobileNetV5 → 16×16)
         spatial_merge_size=1,
         temporal_patch_size=1,
-        image_mean=(0.5, 0.5, 0.5),
-        image_std=(0.5, 0.5, 0.5),
+        # Gemma3n (SiglipImageProcessorFast) rescales to [0,1] only; do_normalize=false.
+        # Mean 0 / std 1 makes the runner's normalize step a no-op.
+        image_mean=(0.0, 0.0, 0.0),
+        image_std=(1.0, 1.0, 1.0),
         rescale_factor=1.0 / 255.0,
     ),
 }
@@ -557,6 +559,9 @@ class BatchedF16VisionEncoder(nn.Module):
     StaticVisionEncoder emits f32 [num_visual_tokens, text_hidden]; PR #65 expects
     f16/bf16 [1, image_token_count, hidden] (a leading batch dim, like embed.aimodel).
     The vision math stays in f32; only the final result is batched and cast to f16.
+
+    Encoders that already emit a batched [1, tokens, hidden] tensor (e.g. Gemma3n,
+    which mirrors HF get_image_features) are passed through without re-batching.
     """
 
     def __init__(self, encoder: nn.Module) -> None:
@@ -567,7 +572,9 @@ class BatchedF16VisionEncoder(nn.Module):
         out = self.encoder(pixel_values)
         if isinstance(out, tuple):
             out = out[0]
-        return out.unsqueeze(0).to(torch.float16)
+        if out.dim() == 2:
+            out = out.unsqueeze(0)
+        return out.to(torch.float16)
 
 
 def _patch_fast_pos_embed_interpolate(vision_model_cls: type) -> None:
