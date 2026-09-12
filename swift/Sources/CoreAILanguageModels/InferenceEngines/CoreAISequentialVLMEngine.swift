@@ -3,7 +3,6 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-// TODO: Refactor to re-use common components with CoreAISequentialEngine
 // TODO: Add pipelined engine variant for higher throughput
 
 import CoreAI
@@ -67,8 +66,12 @@ public struct VLMModelConfig: InferenceConfiguration, Codable, Sendable {
 /// 2. `generate(with: InputEmbeddings, tokens:, ...)` — embed tokens, scatter-merge with vision
 ///    embeddings at placeholder positions, run LLM prefill, then standard autoregressive decode
 ///
-/// KV cache is managed identically to `CoreAISequentialEngine`: starts small and grows
-/// dynamically with 2x expansion.
+/// Decode-loop machinery is shared with `CoreAISequentialEngine`: the KV cache goes through
+/// `StateHandlerFactory`/`SyncStateHandler` (allocation, 2x growth, copy-on-grow, reset), the
+/// in-flight generation token through `GenerationTokenBox`, chunked prefill through
+/// `runChunkedPrefill`, and the iterator's token-count clamp and next-token selection through
+/// `SequentialIterator`. What stays VLM-specific is the vision/embed pipeline, scatter-merge,
+/// and the embeddings-input LLM contract.
 public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchecked Sendable {
     public typealias ConfigType = VLMModelConfig
     public typealias OutputSequence = GenerationSequence
@@ -886,9 +889,7 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         if tokenIndex == 0 {
             tokenBox.cancelActive()
             let resetSpan = InstrumentsProfiler.beginReset(engine: "CoreAIVLM")
-            processedTokenCount = 0
-            kvCache.reset()
-            additionalStates?.reset()
+            clearGenerationState()
             resetSpan.end()
         } else {
             processedTokenCount = tokenIndex
@@ -910,6 +911,11 @@ public final class CoreAISequentialVLMEngine: MultimodalInferenceEngine, @unchec
         let dummyTokens: ArraySlice<Int32> = [Int32(1)][...]
         _ = try await processTokenBatch(dummyTokens)
         // Reset state after warmup
+        clearGenerationState()
+    }
+
+    /// Rewind to an empty context: clear the token cursor and zero the persistent KV state.
+    private func clearGenerationState() {
         processedTokenCount = 0
         kvCache.reset()
         additionalStates?.reset()
