@@ -774,7 +774,10 @@ async def export_gemma3n_text_bundle(
     overwrite: bool,
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> Path:
-    """Export Gemma 3n VLM text bundle (3-input decoder: input_ids + inputs_embeds + position_ids)."""
+    """Export Gemma 3n VLM text bundle.
+
+    3-input decoder: input_ids + inputs_embeds + position_ids.
+    """
     from coreai_models.models.macos.gemma3n_vlm import Gemma3nForCausalLMEmbeddings
 
     output_name = spec.output_name
@@ -816,7 +819,6 @@ async def export_gemma3n_text_bundle(
     inputs_embeds = torch.randn(1, QUERY_LEN, hidden_size, dtype=torch.float16)
     position_ids = torch.arange(QUERY_LEN + OFFSET, dtype=torch.int32).unsqueeze(0)
 
-    n_layers = num_layers or text_cfg.num_hidden_layers
     n_kv_heads = text_cfg.num_key_value_heads
     head_dim = getattr(text_cfg, "head_dim", hidden_size // text_cfg.num_attention_heads)
     # Gemma3n uses compact KV cache slots (shared layers reuse slots)
@@ -840,7 +842,9 @@ async def export_gemma3n_text_bundle(
         "v_cache": None,
     }
 
-    logging.info("Exporting Gemma3n text decoder (3-input: input_ids + inputs_embeds + position_ids)...")
+    logging.info(
+        "Exporting Gemma3n text decoder (3-input: input_ids + inputs_embeds + position_ids)..."
+    )
     program = export_to_coreai(
         model,
         reference_inputs,
@@ -934,24 +938,32 @@ async def export_gemma3n_vision_encoder(
     hf_model = hf_model.eval()
 
     text_hidden = hf_model.config.text_config.hidden_size
+    vision_hidden = hf_model.config.vision_config.hidden_size
+    num_soft_tokens = hf_model.config.vision_soft_tokens_per_image
 
     wrapper = Gemma3nVisionEncoder(
         vision_tower=hf_model.model.vision_tower,
         embedder=hf_model.model.embed_vision,
-        hidden_size=text_hidden,
+        vision_hidden_size=vision_hidden,
+        num_soft_tokens=num_soft_tokens,
     ).eval()
     del hf_model
 
     pixel_shape = (1, 3, spec.image_size, spec.image_size)
     with torch.no_grad():
         test_out = wrapper(torch.randn(*pixel_shape, dtype=torch.float32))
-        logging.info(f"Vision encoder output {tuple(test_out.shape)}; expected [1, 256, {text_hidden}]")
+        logging.info(
+            f"Vision encoder output {tuple(test_out.shape)}; "
+            f"expected [1, {num_soft_tokens}, {text_hidden}]"
+        )
 
     export_module = BatchedF16VisionEncoder(wrapper).eval()
 
     reference_inputs = {"pixel_values": torch.randn(*pixel_shape, dtype=torch.float32)}
 
-    logging.info(f"Exporting Gemma3n vision encoder (MobileNetV5, {spec.image_size}×{spec.image_size})...")
+    logging.info(
+        f"Exporting Gemma3n vision encoder (MobileNetV5, {spec.image_size}×{spec.image_size})..."
+    )
     program = export_to_coreai(
         export_module,
         reference_inputs,

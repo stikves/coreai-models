@@ -14,50 +14,58 @@ import math
 import torch
 import torch.nn as nn
 from transformers.models.gemma3n.configuration_gemma3n import Gemma3nTextConfig
-from transformers.models.gemma3n.modeling_gemma3n import (
-    Gemma3nForCausalLM as HFGemma3nForCausalLM,
-)
-from typing_extensions import Self, override
 
 from coreai_models.models.macos.gemma3n import (
     Gemma3nForCausalLM,
     Gemma3nModel,
 )
 from coreai_models.primitives.macos.cache import KVCache
-from coreai_models.primitives.macos.rms_norm import RMSNorm
 
 
 class Gemma3nVisionEncoder(nn.Module):
     """MobileNetV5 vision tower + multimodal embedder.
 
     Input:  pixel_values  float16 [1, 3, 224, 224]
-    Output: image_embeds  float16 [1, 256, hidden_size]
+    Output: image_embeds  float16 [1, num_soft_tokens, text_hidden_size]
+
+    Mirrors ``Gemma3nModel.get_image_features``: reshape the conv feature map to a
+    token sequence, scale by ``sqrt(vision_hidden_size)``, then run the embedder
+    (soft_embedding_norm → embedding_projection → embedding_post_projection_norm).
     """
 
     def __init__(
         self,
         vision_tower: nn.Module,
         embedder: nn.Module,
-        hidden_size: int,
+        vision_hidden_size: int,
+        num_soft_tokens: int,
     ) -> None:
         super().__init__()
         self.vision_tower = vision_tower
         self.soft_embedding_norm = embedder.soft_embedding_norm
         self.embedding_projection = embedder.embedding_projection
-        self.post_projection_norm = embedder.post_projection_norm
-        self.scale = math.sqrt(hidden_size)
+        self.embedding_post_projection_norm = embedder.embedding_post_projection_norm
+        self.vision_hidden_size = vision_hidden_size
+        self.num_soft_tokens = num_soft_tokens
+        # HF scales by the *vision* hidden size (not the text hidden size).
+        self.scale = math.sqrt(vision_hidden_size)
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # MobileNetV5: [B, 3, 224, 224] → [B, 2048, 16, 16]
-        features = self.vision_tower(pixel_values, do_pooling=False)
-        # Reshape to sequence: [B, 2048, 16, 16] → [B, 256, 2048]
-        b, c, h, w = features.shape
-        features = features.reshape(b, c, h * w).transpose(1, 2)
+        # MobileNetV5: [B, 3, 224, 224] → [B, vision_hidden, H, W]
+        vision_outputs = self.vision_tower(
+            pixel_values=pixel_values, do_pooling=False, return_dict=True
+        )
+        features = vision_outputs.last_hidden_state
+        # [B, C, H, W] → [B, H*W, C] (== [B, num_soft_tokens, vision_hidden])
+        b = features.shape[0]
+        features = features.reshape(
+            b, self.vision_hidden_size, self.num_soft_tokens
+        ).permute(0, 2, 1)
         # Scale + embedder: norm → project → norm
         features = features * self.scale
         features = self.soft_embedding_norm(features)
         features = self.embedding_projection(features)
-        features = self.post_projection_norm(features)
+        features = self.embedding_post_projection_norm(features)
         return features
 
 
@@ -92,8 +100,16 @@ class Gemma3nModelEmbeddings(Gemma3nModel):
 class Gemma3nForCausalLMEmbeddings(Gemma3nForCausalLM):
     """Gemma3n VLM text decoder: takes (input_ids, inputs_embeds, position_ids).
 
-    The embed_tokens table is removed from this graph (it lives in embed.aimodel).
-    But embed_tokens_per_layer stays (needed for per-layer AltUp inputs).
+    The decoder's forward never looks up the main embedding table — the runner
+    computes inputs_embeds (via the separate embed.aimodel) and merges vision
+    embeddings before calling this graph. embed_tokens therefore does not appear
+    in the traced graph except through the tied lm_head, exactly as in the
+    text-only decoder. embed_tokens_per_layer stays (per-layer AltUp inputs).
+
+    State-dict handling is inherited unchanged from Gemma3nForCausalLM: the main
+    embedding weight is loaded normally and tied to lm_head, so loading matches
+    the proven text-only path (removing it would orphan the still-declared
+    embed_tokens parameter on the meta device).
     """
 
     def _init_model(self, config: Gemma3nTextConfig) -> None:
@@ -111,11 +127,3 @@ class Gemma3nForCausalLMEmbeddings(Gemma3nForCausalLM):
         cache = KVCache(k_cache, v_cache)
         out = self.model(input_ids, inputs_embeds, position_ids, cache)
         return self.lm_head(out)
-
-    @override
-    def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
-        super()._mutate_state_dict(state_dict)
-        # Remove embed_tokens (lives in embed.aimodel), keep embed_tokens_per_layer
-        for k in list(state_dict.keys()):
-            if "embed_tokens.weight" in k and "per_layer" not in k:
-                del state_dict[k]
