@@ -518,6 +518,40 @@ final class PipelineGate: Sendable {
     }
 }
 
+// MARK: - Sliding-window ring wrap
+
+/// Boundary math for splitting a batched cache write at the sliding-window ring wrap.
+///
+/// The exported `RingKVCache` requires that a batched write not straddle the ring wrap:
+/// `(offset % capacity) + queryLen <= capacity` (see
+/// `python/src/coreai_models/primitives/macos/cache.py` `update_and_fetch`). A plain decode
+/// (queryLen == 1) is always safe, but a constrained jump-forward batch whose first slot is
+/// near the end of the ring can cross the boundary and fault or silently corrupt the cache on
+/// sliding models. Full-context (non-sliding) models are unaffected.
+enum SlidingWrap {
+    /// Sub-batch lengths (summing to `queryLen`) so no sub-batch straddles the wrap.
+    ///
+    /// Returns `[queryLen]` (no split) for non-sliding models (`capacity == nil`), for a single
+    /// token, or when the batch already fits before the wrap. `offset` is the absolute write
+    /// position where the batch starts, which the exported graph maps to ring slot
+    /// `offset % capacity`.
+    static func splitLengths(offset: Int, queryLen: Int, capacity: Int?) -> [Int] {
+        guard let capacity, capacity > 0, queryLen > 1, offset >= 0 else { return [queryLen] }
+        let slot = offset % capacity
+        if slot + queryLen <= capacity { return [queryLen] }
+        var lengths: [Int] = []
+        var remaining = queryLen
+        var s = slot
+        while remaining > 0 {
+            let take = min(remaining, capacity - s)
+            lengths.append(take)
+            remaining -= take
+            s = (s + take) % capacity
+        }
+        return lengths
+    }
+}
+
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
@@ -570,6 +604,11 @@ private struct EngineImpl: ~Copyable {
     // States 0/1 are KV cache; additional states handled by handler.
     var additionalStates: FixedMTLBufferState?
     var hasNonTruncatableStates: Bool
+
+    // Sliding-window (ring buffer) capacity, i.e. the window dimension of the sliding cache
+    // state shape. nil for non-sliding models. Used by the jump-forward wrap-split guard so a
+    // batched constrained encode never straddles the ring wrap. See SlidingWrap.
+    let slidingCacheCapacity: Int?
 
     // Logits — reuses GrowingLogitsBuffer from TensorStorage+CoreAI.swift
     var logits: GrowingLogitsBuffer
@@ -624,6 +663,21 @@ private struct EngineImpl: ~Copyable {
         // Classify states using the shared factory logic
         let classified = StateHandlerFactory.classifyStates(
             descriptor: descriptor, stateKinds: nil, verbose: descriptor.stateNames.count > 2)
+
+        // Sliding-window ring capacity from the first sliding cache state. The exported ring
+        // shape is [n_layers, 1, n_kv_heads, capacity, head_dim] (muse_glimmer.py), so capacity
+        // is the window dimension (second-to-last). nil when the model has no sliding cache —
+        // the wrap-split guard is then a no-op.
+        let slidingCapacityLocal: Int? = {
+            for (name, kind) in classified where kind == .slidingCache {
+                guard case .ndArray(let desc) = descriptor.stateDescriptor(of: name),
+                    desc.shape.count >= 2
+                else { continue }
+                let cap = desc.shape[desc.shape.count - 2]
+                if cap > 0 { return cap }
+            }
+            return nil
+        }()
 
         // Find the growing KV pair (first two states with .kvCache kind)
         let growingNames = classified.filter { $0.kind == .kvCache }.map(\.name)
@@ -826,6 +880,7 @@ private struct EngineImpl: ~Copyable {
         self.kvCache = kvCacheLocal
         self.additionalStates = additionalStatesLocal
         self.hasNonTruncatableStates = classified.contains(where: { $0.kind == .fixed })
+        self.slidingCacheCapacity = slidingCapacityLocal
         self.logits = logitsRef
         self.cachedSampler = nil
         self.cachedSamplerTemperature = nil
@@ -1347,22 +1402,43 @@ private struct EngineImpl: ~Copyable {
                 if case .terminated = postJumpMask { break }
                 let applyMaskAfterJump = postJumpMask == .constrained
 
-                lastToken = try await withCheckedThrowingContinuation { cont in
-                    do {
-                        try _encodeStepForConstrainedGeneration(
-                            tokens: [lastToken] + jumpTokens,
-                            gpuSampler: gpuSampler,
-                            applyBitmask: applyMaskAfterJump
-                        ) { token, error in
-                            if let error = error {
-                                cont.resume(throwing: error)
-                            } else {
-                                cont.resume(returning: token)
+                // On sliding-window (ring) models this batch can straddle the ring wrap, which
+                // the exported RingKVCache forbids. Split it at the wrap boundary so each
+                // sub-encode satisfies (offset % capacity) + queryLen <= capacity. Only the final
+                // sub-batch samples the real next token under the grammar bitmask; earlier
+                // sub-batches only write K/V (their sampled token is discarded). The grammar
+                // matcher already accepted every token above, so splitting the encode does not
+                // touch matcher state, and processedTokenCount advances per sub-batch as before.
+                // On non-sliding models this is one sub-batch, byte-identical to the old path.
+                let jumpBatch = [lastToken] + jumpTokens
+                let splitLengths = SlidingWrap.splitLengths(
+                    offset: processedTokenCount, queryLen: jumpBatch.count,
+                    capacity: slidingCacheCapacity)
+                var batchStart = 0
+                for (subIndex, subLength) in splitLengths.enumerated() {
+                    let isLastSubBatch = subIndex == splitLengths.count - 1
+                    let subTokens = Array(jumpBatch[batchStart..<batchStart + subLength])
+                    batchStart += subLength
+
+                    let sampled: Int32 = try await withCheckedThrowingContinuation {
+                        (cont: CheckedContinuation<Int32, any Error>) in
+                        do {
+                            try _encodeStepForConstrainedGeneration(
+                                tokens: subTokens,
+                                gpuSampler: gpuSampler,
+                                applyBitmask: isLastSubBatch ? applyMaskAfterJump : false
+                            ) { token, error in
+                                if let error = error {
+                                    cont.resume(throwing: error)
+                                } else {
+                                    cont.resume(returning: token)
+                                }
                             }
+                        } catch {
+                            cont.resume(throwing: error)
                         }
-                    } catch {
-                        cont.resume(throwing: error)
                     }
+                    if isLastSubBatch { lastToken = sampled }
                 }
 
                 // Emit the deterministic jump-forward tokens now. The freshly sampled
