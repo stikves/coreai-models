@@ -115,7 +115,7 @@ def _is_layer_key_beyond(key: str, num_layers: int) -> bool:
     Returns:
         True if the key should be dropped (layer index >= num_layers)
     """
-    match = re.search(r"\.layers\.(\d+)\.", key)
+    match = re.search(r"(?:^|\.)layers\.(\d+)\.", key)
     if match is None:
         return False
     return int(match.group(1)) >= num_layers
@@ -240,26 +240,27 @@ def _build_safetensors_key_index(
 ) -> tuple[dict[int, dict[str, str]], dict[str, str]]:
     """Build a key-to-file index from safetensors files without loading tensors.
 
-    Keys that do not start with ``hf_state_dict_prefix`` are skipped. Use this
-    to load only a sub-model from multimodal checkpoints (e.g., set
+    Keys that do not start with ``hf_state_dict_prefix`` are skipped, except the
+    top-level ``lm_head.weight`` of an untied checkpoint, which is always kept. Use
+    this to load only a sub-model from multimodal checkpoints (e.g., set
     ``hf_state_dict_prefix="language_model."`` to ignore vision/projector keys).
 
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.")
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
         with safe_open(path, framework="pt", device="cpu") as f:
             for key in f.keys():  # noqa: SIM118
-                if not key.startswith(hf_state_dict_prefix):
+                if not key.startswith(hf_state_dict_prefix) and key != "lm_head.weight":
                     continue
                 stripped = key.removeprefix(hf_state_dict_prefix)
 
                 if num_layers is not None and _is_layer_key_beyond(stripped, num_layers):
                     continue
-                match = layer_pattern.match(stripped)
+                match = layer_pattern.search(stripped)
                 if match:
                     layer_idx = int(match.group(1))
                     per_layer.setdefault(layer_idx, {})[key] = path
@@ -725,6 +726,10 @@ class BaseForCausalLM(torch.nn.Module):
 
         raw_config = AutoConfig.from_pretrained(model_dir)
         hf_config = getattr(raw_config, hf_config_attr) if hf_config_attr else raw_config
+        # Multimodal checkpoints keep tie_word_embeddings on the top-level config, not
+        # the text sub-config; from_hf resolves it from the top level, so mirror that.
+        if hf_config is not raw_config and hasattr(raw_config, "tie_word_embeddings"):
+            hf_config.tie_word_embeddings = raw_config.tie_word_embeddings
 
         config = cls._get_reauthored_config(hf_config, max_context_length, num_layers=num_layers)
 
@@ -746,6 +751,12 @@ class BaseForCausalLM(torch.nn.Module):
         shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
+
+        # A prefix that includes the model root (e.g. "model.language_model.") strips it
+        # off shared keys too, leaving them ("embed_tokens.weight", ...) outside the
+        # model namespace; restore the root so they match the model's parameters.
+        model_keys = set(model.state_dict())
+        shared_dict = {(k if k in model_keys else "model." + k): v for k, v in shared_dict.items()}
 
         if mmap_path is not None:
             os.makedirs(mmap_path, exist_ok=True)
