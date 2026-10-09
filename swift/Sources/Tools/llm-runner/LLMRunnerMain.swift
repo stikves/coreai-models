@@ -250,6 +250,20 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     @Option(name: .customLong("verbose-level"), help: "Verbosity level (default: 1, implies --verbose)")
     var verboseLevel: Int?
 
+    @Flag(
+        name: .customLong("batch-prototype"),
+        help:
+            "Diagnostic: run the prompt as an N-row fixed batch (row 0 greedy, rows 1..N-1 temperature) through a batch=N graph to exercise lockstep batched decode on GPU. Requires --inference-engine-variant coreai-sequential and a batch-capable model."
+    )
+    var batchPrototype: Bool = false
+
+    @Option(
+        name: .customLong("batch-prototype-rows"),
+        help:
+            "Number of rows for --batch-prototype (default 2). Repeats the prompt N times; row 0 greedy, rows 1..N-1 temperature. Use to exercise a batch graph at N=2, N=3, ..."
+    )
+    var batchPrototypeRows: Int = 2
+
     func validate() throws {
         if warmup == .exact && warmupLength == nil {
             throw ValidationError("--warmup exact requires --warmup-length N")
@@ -565,6 +579,48 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         CLILogger.log("   Max generation tokens: \(maxTokens)", component: "Main")
         CLILogger.log("   Required context length: \(requiredContextLength)", component: "Main")
         // Engines will validate context length during inference
+
+        // --batch-prototype: run the prompt as an N-row fixed batch (row 0 greedy, rows 1..N-1
+        // temperature) through the batch=N graph.
+        if batchPrototype {
+            guard let seqEngine = inferenceEngine as? CoreAISequentialEngine else {
+                throw ValidationError(
+                    "--batch-prototype requires --inference-engine-variant coreai-sequential")
+            }
+            var eosTokenIds = Set<Int32>()
+            if let eos = tokenizer.eosTokenId { eosTokenIds.insert(Int32(eos)) }
+            eosTokenIds.formUnion(additionalEosTokenIds)
+            let promptI32 = promptTokens.map { Int32($0) }
+            let temp = temperature > 0 ? temperature : 0.8
+            let n = max(1, batchPrototypeRows)
+            guard n <= bundle.maxBatchSize else {
+                throw ValidationError(
+                    "--batch-prototype-rows \(n) exceeds the asset's max batch size "
+                        + "\(bundle.maxBatchSize). Re-export with --dynamic-batch-size >= \(n), "
+                        + "or lower --batch-prototype-rows.")
+            }
+            // Row 0 greedy, rows 1..N-1 temperature with distinct seeds. Same prompt in every row
+            // so all rows are equal-length (lockstep requires it).
+            let rowsIn = Array(repeating: promptI32, count: n)
+            var configs: [SamplingConfiguration] = [.greedy]
+            for r in 1..<max(1, n) {
+                configs.append(SamplingConfiguration(temperature: temp, seed: UInt64(1234 + r)))
+            }
+            print(
+                "Batched prototype: \(n) rows (row 0 greedy, rows 1..\(n - 1) temp=\(temp)), "
+                    + "prompt=\(promptTokens.count) tokens")
+            let result = try await seqEngine.lockstepBatchedGenerate(
+                promptRows: rowsIn,
+                configs: configs,
+                maxNewTokens: maxTokens,
+                eosTokenIds: eosTokenIds)
+            let rows = result.tokens
+            for (i, row) in rows.enumerated() {
+                let label = i == 0 ? "greedy" : "temp=\(temp)"
+                print("\n=== row \(i) (\(label)) ===\n" + tokenizer.decode(tokens: row.map { Int($0) }))
+            }
+            return
+        }
 
         // VLM path: if --image is provided and engine supports multimodal
         if let imagePath = imagePath {
