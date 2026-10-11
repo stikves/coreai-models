@@ -28,7 +28,7 @@ uses a different tokenizer and chat template, and is macOS-only here. Both famil
 ## Export models
 
 ```bash
-# Instruct (INT4 quantized with FP16 embedding)
+# Instruct (INT4 with INT8 on blocks 0-1 and lm_head; FP16 embedding)
 uv run coreai.llm.export HuggingFaceTB/SmolLM3-3B
 
 # Base
@@ -77,3 +77,19 @@ swift run -c release llm-benchmark --model path/to/exported_model_folder
 ```
 
 Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p`, `-g`, and `-n`.
+
+## Evaluation
+
+Perplexity on [`WikiText-2`](https://huggingface.co/datasets/EleutherAI/wikitext_document_level) and
+tinyMMLU accuracy, computed with the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness)
+on the Core AI PyTorch models (context 16384, `float16`). BPW is the exported bundle size over the parameter
+count; the mixed recipe stores a separate INT8 `lm_head` next to the FP16 embedding.
+
+| Model     | Compression                                  | BPW   | Platform | Perplexity | tinyMMLU |
+| --------- | -------------------------------------------- | ----- | -------- | ---------- | -------- |
+| 3B        | none (`float16`)                             | 16.07 | macOS    | 10.67      | 0.599    |
+| 3B        | [INT4, INT8 blocks 0-1 + lm_head][mixed]     | 6.46  | macOS    | 11.30      | 0.588    |
+| 3B-Base   | none (`float16`)                             | 16.07 | macOS    | 10.14      | 0.615    |
+| 3B-Base   | [INT4, INT8 blocks 0-1 + lm_head][mixed]     | 6.46  | macOS    | 10.80      | 0.599    |
+
+[mixed]: smollm3_mixed_4bit_8bit.yaml

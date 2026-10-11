@@ -117,6 +117,23 @@ def get_c4(
     return calibration_samples
 
 
+def untie_word_embeddings(model: nn.Module) -> None:
+    """Give a tied ``lm_head`` its own copy of the embedding table.
+
+    coreai-opt resolves a single config for a weight shared by several modules, so a
+    tied ``lm_head`` can only be quantized together with the input embedding. Untying
+    lets a recipe quantize the output projection (e.g. INT8) while the embedding lookup
+    stays in full precision, at the cost of storing both tables.
+    """
+    lm_head = getattr(model, "lm_head", None)
+    embed_tokens = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if lm_head is None or embed_tokens is None or lm_head.weight is not embed_tokens.weight:
+        raise ValueError(
+            "untie_word_embeddings requires a model whose lm_head is tied to model.embed_tokens"
+        )
+    lm_head.weight = nn.Parameter(embed_tokens.weight.detach().clone())
+
+
 def quantize_pytorch_model(
     model: nn.Module,
     inputs: tuple,
@@ -140,9 +157,9 @@ def quantize_pytorch_model(
         inputs: Example inputs for model preparation (used for torch.export).
         dynamic_shapes: Dynamic shape specifications for torch.export.
         quantization_config: Configuration dictionary matching the inner shape
-            coreai-opt expects under `quantization_config`. Includes a
-            `calibrate_activations` key (popped here before constructing the
-            coreai-opt config).
+            coreai-opt expects under `quantization_config`. May include the
+            `calibrate_activations` and `untie_word_embeddings` keys (popped here
+            before constructing the coreai-opt config).
         cache_seq_len: Sequence-dim length the caches in ``inputs`` were traced at,
             used to bound the calibration query length.
         state_indices: Positions in ``inputs`` that are state and must be reset
@@ -166,6 +183,8 @@ def quantize_pytorch_model(
         export_backend = ExportBackend.CoreAI
 
     run_calibration = quantization_config.pop("calibrate_activations", False)
+    if quantization_config.pop("untie_word_embeddings", False):
+        untie_word_embeddings(model)
     config = QuantizerConfig.from_dict({"quantization_config": quantization_config})
 
     # When doing activation quantization, run real calibration data through the

@@ -264,7 +264,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         65536,
-        compression_config="models/smollm3/smollm3_4bit_embedding_excluded.yaml",
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
     ),
     ModelPreset(
         "smollm3-3b-base",
@@ -275,7 +275,7 @@ LLM_PRESETS: list[ModelPreset] = [
         "4bit",
         "float16",
         65536,
-        compression_config="models/smollm3/smollm3_4bit_embedding_excluded.yaml",
+        compression_config="models/smollm3/smollm3_mixed_4bit_8bit.yaml",
     ),
     ModelPreset(
         "gemma-3n-e2b-it",

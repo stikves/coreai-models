@@ -214,7 +214,8 @@ def _is_hf_id(model: str) -> bool:
 def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ignore[no-untyped-def]
     """Load a coreai-opt YAML config and return either a prebuilt coreai-opt config object
     (palettization) or a config dict with extra keys
-    (currently `coreai_models.calibrate_activations`) considered for quantization.
+    (`coreai_models.calibrate_activations`, `coreai_models.untie_word_embeddings`)
+    considered for quantization.
 
     The YAML's top-level must contain exactly one coreai-opt schema key
     (`kmeans_palettization_config` or `quantization_config`).
@@ -236,12 +237,18 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
             f"{yaml_path}: 'coreai_models' must be a mapping, got "
             f"{type(pipeline_level_options).__name__}."
         )
-    allowed_pipeline_level_keys = {"calibrate_activations"}
+    allowed_pipeline_level_keys = {"calibrate_activations", "untie_word_embeddings"}
     unknown = set(pipeline_level_options) - allowed_pipeline_level_keys
     if unknown:
         raise SystemExit(
             f"{yaml_path}: unknown key(s) in 'coreai_models' block: "
             f"{sorted(unknown)}. Allowed: {sorted(allowed_pipeline_level_keys)}."
+        )
+    untie = pipeline_level_options.get("untie_word_embeddings", False)
+    if not isinstance(untie, bool):
+        raise SystemExit(
+            f"{yaml_path}: 'coreai_models.untie_word_embeddings' must be true or false, "
+            f"got {untie!r}."
         )
 
     if len(yaml_data) != 1:
@@ -274,12 +281,14 @@ def _load_compression_config_object(yaml_path: Path, variant: str):  # type: ign
         QuantizerConfig.from_dict({top_key: inner})
         # Re-inline our extension keys into the inner dict. The downstream
         # pipeline path (pipeline.py + compression.quantize_pytorch_model)
-        # pops `calibrate_activations` off the dict before rebuilding the
+        # pops `calibrate_activations` / `untie_word_embeddings` off the dict before rebuilding the
         # coreai-opt config, mirroring how the built-in presets path
         # carries the flag.
         merged = dict(inner)
         if "calibrate_activations" in pipeline_level_options:
             merged["calibrate_activations"] = pipeline_level_options["calibrate_activations"]
+        if untie:
+            merged["untie_word_embeddings"] = True
         return merged
 
     raise SystemExit(
