@@ -44,7 +44,19 @@ class Attention(nn.Module):
 
         self.sdpa = SDPA(is_causal=True)
         assert is_default_rope_scaling(config), f"unsupported rope_scaling: {config.rope_scaling}"
-        self.rope = initialize_rope(base=resolve_rope_theta(config))
+        rope_theta = resolve_rope_theta(config)
+        self.rope = initialize_rope(base=rope_theta)
+        # Past 32K positions, fp16 RoPE angles lose precision (and overflow at
+        # 65504), so long-context exports pass f32 inverse frequencies instead.
+        self._rope_freqs: torch.Tensor | None = None
+        if config.max_position_embeddings > 32768:
+            with torch.device("cpu"):
+                self._rope_freqs = 1.0 / (
+                    rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+                )
+        # SmolLM3-style NoPE: `no_rope_layers[i] == 0` means layer i skips RoPE.
+        no_rope_layers = getattr(config, "no_rope_layers", None)
+        self.use_rope = bool(no_rope_layers[layer_idx]) if no_rope_layers else True
 
     def forward(
         self,
@@ -75,14 +87,16 @@ class Attention(nn.Module):
         offset = seq_len - query_len
         torch._check_is_size(offset)
         rope_positions = position_ids.narrow(-1, offset, query_len)
+        freqs = None if self._rope_freqs is None else self._rope_freqs.to(device=x.device)
 
         if USE_FUSED_KV:
-            query_key = self.rope(query_key, position_ids=rope_positions)
+            if self.use_rope:
+                query_key = self.rope(query_key, position_ids=rope_positions, freqs=freqs)
             query = query_key.narrow(1, 0, n_heads)
             key = query_key.narrow(1, n_heads, n_kv_heads)
-        else:
-            query = self.rope(query, position_ids=rope_positions)
-            key = self.rope(key, position_ids=rope_positions)
+        elif self.use_rope:
+            query = self.rope(query, position_ids=rope_positions, freqs=freqs)
+            key = self.rope(key, position_ids=rope_positions, freqs=freqs)
 
         if cache is not None:
             key, value = cache.update_and_fetch(

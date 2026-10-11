@@ -135,6 +135,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.qwen3_vl import (
         Qwen3VLForCausalLM,
     )
+    from coreai_models.models.macos.smollm3 import SmolLM3ForCausalLM
 
     return {
         "diffusion_gemma_text": ModelEntry(
@@ -205,6 +206,9 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=Qwen3_5ForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+        ),
+        "smollm3": ModelEntry(
+            macos_class=SmolLM3ForCausalLM,
         ),
         # Qwen3-VL: vision-language model.
         # macos_class = standard text decoder (input_ids, for text-only use).

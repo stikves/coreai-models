@@ -269,6 +269,24 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1"
         ),
     ),
+    "HuggingFaceTB/SmolLM3-3B": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B is a 3B-parameter instruction-tuned causal language model "
+            "from HuggingFace with switchable reasoning (think / no_think) and tool calling. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B"
+        ),
+    ),
+    "HuggingFaceTB/SmolLM3-3B-Base": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolLM3-3B-Base is the 3B-parameter pretrained base causal language "
+            "model from HuggingFace. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolLM3-3B-Base"
+        ),
+    ),
     "HuggingFaceTB/SmolLM2-1.7B-Instruct": AIModelMetadataFields(
         author="HuggingFace",
         license="Apache-2.0",
