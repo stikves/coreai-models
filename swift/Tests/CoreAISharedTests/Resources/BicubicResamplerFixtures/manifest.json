@@ -1,0 +1,76 @@
+{
+ "cases": [
+  {
+   "name": "rgb_noise_up",
+   "mode": "RGB",
+   "width": 37,
+   "height": 23,
+   "target_height": 48,
+   "target_width": 96
+  },
+  {
+   "name": "rgb_photo_down",
+   "mode": "RGB",
+   "width": 100,
+   "height": 65,
+   "target_height": 48,
+   "target_width": 96
+  },
+  {
+   "name": "gray_down",
+   "mode": "L",
+   "width": 120,
+   "height": 90,
+   "target_height": 48,
+   "target_width": 48
+  },
+  {
+   "name": "rgba_semi_alpha",
+   "mode": "RGBA",
+   "width": 64,
+   "height": 64,
+   "target_height": 96,
+   "target_width": 48
+  },
+  {
+   "name": "palette",
+   "mode": "P",
+   "width": 80,
+   "height": 60,
+   "target_height": 48,
+   "target_width": 48
+  },
+  {
+   "name": "strip_wide",
+   "mode": "RGB",
+   "width": 300,
+   "height": 5,
+   "target_height": 48,
+   "target_width": 192
+  },
+  {
+   "name": "checker_contrast",
+   "mode": "RGB",
+   "width": 50,
+   "height": 50,
+   "target_height": 48,
+   "target_width": 96
+  },
+  {
+   "name": "width_only",
+   "mode": "RGB",
+   "width": 70,
+   "height": 48,
+   "target_height": 48,
+   "target_width": 96
+  },
+  {
+   "name": "rgb16",
+   "mode": "RGB",
+   "width": 21,
+   "height": 13,
+   "target_height": 48,
+   "target_width": 48
+  }
+ ]
+}

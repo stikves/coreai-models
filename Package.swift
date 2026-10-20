@@ -351,7 +351,10 @@ let package = Package(
         .testTarget(
             name: "CoreAISharedTests",
             dependencies: ["CoreAIShared", "TestUtilities"],
-            path: "swift/Tests/CoreAISharedTests"
+            path: "swift/Tests/CoreAISharedTests",
+            resources: [
+                .copy("Resources/BicubicResamplerFixtures")
+            ]
         ),
         .testTarget(
             name: "CoreAILMCommonTests",
