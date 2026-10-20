@@ -298,6 +298,21 @@ let package = Package(
             ]
         ),
 
+        // Image + text semantic search over CoreAIEmbeddings + CoreAIVectorIndex
+        .executableTarget(
+            name: "embedding-search",
+            dependencies: [
+                "CoreAIEmbeddings",
+                "CoreAIShared",
+                "CoreAIVectorIndex",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/embedding-search",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // Public LLM Benchmark CLI (based on mlx-lm benchmark)
         .executableTarget(
             name: "llm-benchmark",
@@ -420,6 +435,17 @@ let package = Package(
                 .copy("Resources/embedding_text_metadata.json"),
                 .copy("Resources/embedding_ane_metadata.json"),
             ]
+        ),
+        .testTarget(
+            name: "EmbeddingSearchTests",
+            dependencies: [
+                "embedding-search",
+                "CoreAIEmbeddings",
+                "CoreAIVectorIndex",
+                "TestUtilities",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Tests/EmbeddingSearchTests"
         ),
         .testTarget(
             name: "SpeechTests",
