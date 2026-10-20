@@ -1,0 +1,190 @@
+{
+  "metadata_version": "0.2",
+  "kind": "embedding",
+  "name": "embeddinggemma-2-ios",
+  "assets": {
+    "token_table": "token_table.aimodel",
+    "encoder": "encoder.aimodel",
+    "image_encoder": "image_encoder.aimodel"
+  },
+  "embedding": {
+    "space": {
+      "id": "google/embeddinggemma-2",
+      "revision": "914f7f89142e33e7"
+    },
+    "dimension": 768,
+    "matryoshka_dimensions": [
+      768,
+      512,
+      256,
+      128
+    ],
+    "renormalize_after_truncation": true,
+    "normalized": true,
+    "metric": "cosine",
+    "precision": {
+      "compute": "float16",
+      "forbidden": [],
+      "compute_units": [
+        "neural_engine",
+        "gpu"
+      ]
+    },
+    "components": {
+      "token_table": {
+        "function": "main",
+        "inputs": [
+          "input_ids"
+        ],
+        "output": "inputs_embeds",
+        "compute_units": [
+          "gpu"
+        ]
+      },
+      "encoder": {
+        "functions": [
+          {
+            "function": "len128_b1",
+            "batch": 1,
+            "length": 128
+          },
+          {
+            "function": "len512_b1",
+            "batch": 1,
+            "length": 512
+          },
+          {
+            "function": "len1024_b1",
+            "batch": 1,
+            "length": 1024
+          }
+        ],
+        "inputs": [
+          "inputs_embeds",
+          "bias",
+          "pool_weights"
+        ],
+        "output": "embedding",
+        "mask_encoding": "additive_bias",
+        "compute_units": [
+          "neural_engine"
+        ]
+      },
+      "image_encoder": {
+        "function": "main",
+        "inputs": [
+          "pixel_values",
+          "position_ids"
+        ],
+        "output": "soft_tokens",
+        "compute_units": [
+          "neural_engine"
+        ]
+      }
+    },
+    "towers": [
+      {
+        "modality": "text",
+        "pipeline": [
+          "token_table",
+          "encoder"
+        ],
+        "inputs": {
+          "input_ids": "int32[B,L]",
+          "attention_mask": "int32[B,L]"
+        },
+        "output": "embedding",
+        "batch_sizes": [
+          1
+        ],
+        "length_buckets": [
+          128,
+          512,
+          1024
+        ]
+      },
+      {
+        "modality": "image",
+        "pipeline": [
+          "image_encoder",
+          "token_table",
+          "encoder"
+        ],
+        "output": "embedding",
+        "batch_sizes": [
+          1
+        ],
+        "length_buckets": [
+          512,
+          1024
+        ]
+      }
+    ],
+    "text": {
+      "tokenizer": "tokenizer",
+      "padding_side": "right",
+      "special_tokens": {
+        "bos": true,
+        "eos": true,
+        "bos_token_id": 2,
+        "eos_token_id": 1,
+        "pad_token_id": 0
+      },
+      "truncation": {
+        "keep_eos": true,
+        "max_tokens": 1024
+      },
+      "model_max_tokens": 8192,
+      "prompts": {
+        "query": "task: search result | query: ",
+        "document": "title: none | text: ",
+        "sentence_similarity": "task: sentence similarity | query: ",
+        "classification": "task: classification | query: ",
+        "clustering": "task: clustering | query: ",
+        "question_answering": "task: question answering | query: ",
+        "fact_checking": "task: fact checking | query: ",
+        "code_retrieval": "task: code retrieval | query: "
+      },
+      "default_prompt_name": null,
+      "document_template": "title: {title} | text: {text}"
+    },
+    "merge": {
+      "placeholder_ids": {
+        "image": 258880
+      },
+      "token_ids": {
+        "boi": 255999,
+        "eoi": 258882
+      }
+    },
+    "preprocessing": {
+      "image": {
+        "patch_size": 16,
+        "rescale_factor": 0.00392156862745098,
+        "normalize": false,
+        "image_mean": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "image_std": [
+          1.0,
+          1.0,
+          1.0
+        ],
+        "max_soft_tokens": 280,
+        "pooling_kernel_size": 3
+      }
+    }
+  },
+  "source": {
+    "model_definition": "torch",
+    "hf_model_id": "google/embeddinggemma-2",
+    "hf_revision": "914f7f89142e33e77833254d9c9b90c3cef7303b"
+  },
+  "compression": null,
+  "compilation": {
+    "date": "2026-10-12T00:00:00-07:00",
+    "targets": []
+  }
+}
