@@ -111,6 +111,15 @@ let package = Package(
             ]
         ),
 
+        // Model-agnostic exact vector index (Accelerate brute force)
+        .target(
+            name: "CoreAIVectorIndex",
+            path: "swift/Sources/CoreAIVectorIndex",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
         // Speech recognition library
         .target(
             name: "CoreAISpeech",
@@ -371,6 +380,11 @@ let package = Package(
             linkerSettings: [
                 .linkedLibrary("c++")
             ]
+        ),
+        .testTarget(
+            name: "CoreAIVectorIndexTests",
+            dependencies: ["CoreAIVectorIndex"],
+            path: "swift/Tests/CoreAIVectorIndexTests"
         ),
         .testTarget(
             name: "SpeechTests",
