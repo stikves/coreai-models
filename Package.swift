@@ -51,6 +51,10 @@ let package = Package(
                 "CoreAIObjectDetector"
             ]
         ),
+        .library(
+            name: "CoreAIEmbeddings",
+            targets: ["CoreAIEmbeddings", "CoreAIVectorIndex"]
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
@@ -115,6 +119,20 @@ let package = Package(
         .target(
             name: "CoreAIVectorIndex",
             path: "swift/Sources/CoreAIVectorIndex",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
+        // Embedding model runtime (kind: "embedding" bundles)
+        .target(
+            name: "CoreAIEmbeddings",
+            dependencies: [
+                "CoreAIShared",
+                "CoreAIVectorIndex",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Sources/CoreAIEmbeddings",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
@@ -298,7 +316,8 @@ let package = Package(
         .target(
             name: "TestUtilities",
             dependencies: [
-                .product(name: "Transformers", package: "swift-transformers")
+                "CoreAIEmbeddings",
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "swift/Tests/TestUtilities",
             swiftSettings: [
@@ -385,6 +404,22 @@ let package = Package(
             name: "CoreAIVectorIndexTests",
             dependencies: ["CoreAIVectorIndex"],
             path: "swift/Tests/CoreAIVectorIndexTests"
+        ),
+        .testTarget(
+            name: "CoreAIEmbeddingsTests",
+            dependencies: [
+                "CoreAIEmbeddings",
+                "CoreAIShared",
+                "CoreAIVectorIndex",
+                "TestUtilities",
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "swift/Tests/CoreAIEmbeddingsTests",
+            resources: [
+                .copy("Resources/GemmaStyleTokenizer"),
+                .copy("Resources/embedding_text_metadata.json"),
+                .copy("Resources/embedding_ane_metadata.json"),
+            ]
         ),
         .testTarget(
             name: "SpeechTests",
