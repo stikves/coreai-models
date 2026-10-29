@@ -148,4 +148,43 @@ struct MultimodalTypeTests {
         #expect(config.tokenMerge == .separateEmbedding)
         #expect(config.poolingKernelSize == nil)
     }
+
+    @Test("VisionConfig decodes image wrapper token ids and defaults them to empty")
+    func visionConfigImageWrapperTokens() throws {
+        let json = """
+            {
+                "image_size": 512, "patch_size": 16, "image_token_count": 64, "image_token_id": 49190,
+                "image_prefix_token_ids": [49189, 49152], "image_suffix_token_ids": [49189]
+            }
+            """
+        let config = try JSONDecoder().decode(VisionConfig.self, from: json.data(using: .utf8)!)
+        #expect(config.imagePrefixTokenIds == [49189, 49152])
+        #expect(config.imageSuffixTokenIds == [49189])
+
+        let plain = try JSONDecoder().decode(
+            VisionConfig.self,
+            from: #"{"image_size": 896, "patch_size": 14, "image_token_count": 256, "image_token_id": 9}"#
+                .data(using: .utf8)!)
+        #expect(plain.imagePrefixTokenIds.isEmpty)
+        #expect(plain.imageSuffixTokenIds.isEmpty)
+    }
+
+    @Test("Image token run is prefix + N image tokens + suffix")
+    func imageTokenRun() {
+        let config = VisionConfig(
+            imageSize: 512, patchSize: 16, imageTokenCount: 3, imageTokenId: 7,
+            imagePrefixTokenIds: [1, 2], imageSuffixTokenIds: [1])
+        #expect(config.imageTokenRun(count: 3) == [1, 2, 7, 7, 7, 1])
+        let bare = VisionConfig(imageSize: 448, patchSize: 16, imageTokenCount: 2, imageTokenId: 7)
+        #expect(bare.imageTokenRun(count: 2) == [7, 7])
+    }
+
+    @Test("Placeholder expansion replaces the first image token and drops the rest")
+    func expandImagePlaceholder() {
+        let config = VisionConfig(
+            imageSize: 512, patchSize: 16, imageTokenCount: 2, imageTokenId: 7,
+            imagePrefixTokenIds: [1], imageSuffixTokenIds: [2])
+        #expect(config.expandImagePlaceholder(in: [5, 7, 6, 7, 8], count: 2) == [5, 1, 7, 7, 2, 6, 8])
+        #expect(config.expandImagePlaceholder(in: [5, 6], count: 2) == nil)
+    }
 }

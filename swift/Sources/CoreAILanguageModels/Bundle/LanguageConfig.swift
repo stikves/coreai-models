@@ -379,6 +379,13 @@ public struct VisionConfig: Codable, Sendable, Equatable {
     /// for a fixed single-size encoder (e.g. Qwen), which uses `imageSize`/`imageTokenCount`.
     public let imageSizes: [Int]?
 
+    /// Token ids the model expects immediately before each image's placeholder run
+    /// (e.g. SmolVLM's `<fake_token_around_image><global-img>`). Empty for most VLMs.
+    public let imagePrefixTokenIds: [Int32]
+
+    /// Token ids the model expects immediately after each image's placeholder run.
+    public let imageSuffixTokenIds: [Int32]
+
     /// CLIP normalization (Qwen VL, Pixtral, InternVL, Phi-3.5-vision).
     public static let clipMean = [0.48145466, 0.4578275, 0.40821073]
     public static let clipStd = [0.26862954, 0.26130258, 0.27577711]
@@ -400,7 +407,9 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         padTokenId: Int32? = nil,
         poolingKernelSize: Int? = nil,
         imageSizes: [Int]? = nil,
-        tokenMerge: VisionTokenMerge = .separateEmbedding
+        tokenMerge: VisionTokenMerge = .separateEmbedding,
+        imagePrefixTokenIds: [Int32] = [],
+        imageSuffixTokenIds: [Int32] = []
     ) {
         self.imageSize = imageSize
         self.patchSize = patchSize
@@ -419,6 +428,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.poolingKernelSize = poolingKernelSize
         self.imageSizes = imageSizes
         self.tokenMerge = tokenMerge
+        self.imagePrefixTokenIds = imagePrefixTokenIds
+        self.imageSuffixTokenIds = imageSuffixTokenIds
     }
 
     enum CodingKeys: String, CodingKey {
@@ -439,6 +450,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         case poolingKernelSize = "pooling_kernel_size"
         case imageSizes = "image_sizes"
         case tokenMerge = "token_merge"
+        case imagePrefixTokenIds = "image_prefix_token_ids"
+        case imageSuffixTokenIds = "image_suffix_token_ids"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -460,6 +473,8 @@ public struct VisionConfig: Codable, Sendable, Equatable {
         self.poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize)
         self.imageSizes = try c.decodeIfPresent([Int].self, forKey: .imageSizes)
         self.tokenMerge = try c.decodeIfPresent(VisionTokenMerge.self, forKey: .tokenMerge) ?? .separateEmbedding
+        self.imagePrefixTokenIds = try c.decodeIfPresent([Int32].self, forKey: .imagePrefixTokenIds) ?? []
+        self.imageSuffixTokenIds = try c.decodeIfPresent([Int32].self, forKey: .imageSuffixTokenIds) ?? []
         try validate(in: c)
     }
 
@@ -510,6 +525,19 @@ public struct VisionConfig: Codable, Sendable, Equatable {
                         + "(\(blockPixels))")
             }
         }
+    }
+
+    /// The tokens that stand for one image in the prompt: prefix, `count` image tokens, suffix.
+    public func imageTokenRun(count: Int) -> [Int32] {
+        imagePrefixTokenIds + [Int32](repeating: imageTokenId, count: count) + imageSuffixTokenIds
+    }
+
+    /// Replaces the first image placeholder in `tokens` with ``imageTokenRun(count:)`` and drops
+    /// any further placeholders. Returns nil when `tokens` has no placeholder.
+    public func expandImagePlaceholder(in tokens: [Int32], count: Int) -> [Int32]? {
+        guard let index = tokens.firstIndex(of: imageTokenId) else { return nil }
+        let rest = tokens[(index + 1)...].filter { $0 != imageTokenId }
+        return Array(tokens[..<index]) + imageTokenRun(count: count) + rest
     }
 }
 

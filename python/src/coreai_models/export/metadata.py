@@ -334,6 +334,36 @@ _METADATA: dict[str, AIModelMetadataFields] = {
             "Source: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct"
         ),
     ),
+    "HuggingFaceTB/SmolVLM2-256M-Video-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolVLM2-256M-Video-Instruct is a 256M-parameter vision-language "
+            "model from HuggingFace with a SigLIP vision encoder and SmolLM2 "
+            "text decoder. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolVLM2-256M-Video-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolVLM2-500M-Video-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolVLM2-500M-Video-Instruct is a 500M-parameter vision-language "
+            "model from HuggingFace with a SigLIP vision encoder and SmolLM2 "
+            "text decoder. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+        ),
+    ),
+    "HuggingFaceTB/SmolVLM2-2.2B-Instruct": AIModelMetadataFields(
+        author="HuggingFace",
+        license="Apache-2.0",
+        model_description=(
+            "SmolVLM2-2.2B-Instruct is a 2.2B-parameter vision-language model "
+            "from HuggingFace with a SigLIP so400m vision encoder and SmolLM2 "
+            "text decoder. "
+            "Source: https://huggingface.co/HuggingFaceTB/SmolVLM2-2.2B-Instruct"
+        ),
+    ),
     # ---- Diffusion ----
     "black-forest-labs/FLUX.2-klein-4B": AIModelMetadataFields(
         author="Black Forest Labs",

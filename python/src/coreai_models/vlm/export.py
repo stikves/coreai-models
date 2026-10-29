@@ -10,13 +10,14 @@ Exports a vision-language model to Core AI format as a multi-asset bundle
 
   - ``<name>.aimodel``   text decoder (asset role ``main``, inputs_embeds, stateful KV)
   - ``embed.aimodel``    token-embedding lookup (asset role ``embedding``)
-  - ``vision.aimodel``   vision encoder (asset role ``vision``, 448x448 static shapes)
+  - ``vision.aimodel``   vision encoder (asset role ``vision``, static shapes per model)
   - ``tokenizer/``       embedded HF tokenizer
   - ``metadata.json``    bundle manifest (``kind=vlm``)
 
 Usage:
     uv run coreai.vlm.export qwen3-vl [--max-context-length 4096] [--num-layers N]
     uv run coreai.vlm.export muse-glimmer-vl [--max-context-length 4096]
+    uv run coreai.vlm.export smolvlm2-256m|smolvlm2-500m|smolvlm2-2.2b [--max-context-length 4096]
     uv run coreai.vlm.export --list-models
 """
 
@@ -36,12 +37,15 @@ from huggingface_hub import snapshot_download
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
 
-from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO
+from coreai_models._constants import DEFAULT_INCLUDE_DEBUG_INFO, TRACE_KV_CACHE_SEQ_LEN
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.models.macos.muse_glimmer import MuseGlimmerForCausalLMEmbeddings
 from coreai_models.models.macos.muse_glimmer_vision import MuseGlimmerVisionModel
 from coreai_models.models.macos.qwen3_vl import Qwen3VLForCausalLMEmbeddings
+from coreai_models.models.macos.smolvlm import SmolVLMForCausalLMEmbeddings
+from coreai_models.models.macos.smolvlm_vision import SmolVLMVisionModel
+from coreai_models.primitives.macos.cache import KVCache
 
 # Core AI state names for the persistent KV cache.
 KV_STATE_NAMES = ("k_cache", "v_cache")
@@ -70,6 +74,17 @@ class VLMSpec:
     rescale_factor: float
     image_strategy: str = "stretch"
     include_image_info: bool = False
+    # When True, the text decoder's k_cache/v_cache are traced with a dynamic
+    # seq_len dim (grows from TRACE_KV_CACHE_SEQ_LEN up to max_ctx) instead of
+    # a fixed size pinned at max_ctx. Existing VLMs (Qwen3-VL, Muse Glimmer)
+    # trace a static cache; SmolVLM2 is the first to use a growable one.
+    dynamic_kv_cache: bool = False
+    # Text tokens the HF processor places around each image's placeholder run
+    # (written to metadata as ids; Swift emits prefix + N x image token + suffix).
+    image_prefix_tokens: tuple[str, ...] = ()
+    image_suffix_tokens: tuple[str, ...] = ()
+    # Model family for code paths shared across sizes ("qwen3_vl", "muse_glimmer", "smolvlm").
+    family: str = "qwen3_vl"
 
     @property
     def num_visual_tokens(self) -> int:
@@ -106,6 +121,63 @@ SUPPORTED_MODELS: dict[str, VLMSpec] = {
         image_std=(0.26862954, 0.26130258, 0.27577711),
         rescale_factor=1.0,
     ),
+    # SmolVLM2: single 512 (or 384) image, no image splitting (HF default splits large
+    # images into tiles + a global view; we feed the global view only).
+    "smolvlm2-256m": VLMSpec(
+        short_name="smolvlm2-256m",
+        hf_model_id="HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
+        output_name="smolvlm2_256m",
+        image_token_id=49190,  # "<image>" (HF config.image_token_id)
+        image_size=512,
+        patch_size=16,
+        # HF "scale_factor" (pixel shuffle): (512/16/4)**2 = 64 tokens (processor image_seq_len).
+        spatial_merge_size=4,
+        temporal_patch_size=1,  # unused: single-image only, no video export
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        dynamic_kv_cache=True,
+        image_prefix_tokens=("<fake_token_around_image>", "<global-img>"),
+        image_suffix_tokens=("<fake_token_around_image>",),
+        family="smolvlm",
+    ),
+    "smolvlm2-500m": VLMSpec(
+        short_name="smolvlm2-500m",
+        hf_model_id="HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        output_name="smolvlm2_500m",
+        image_token_id=49190,
+        image_size=512,
+        patch_size=16,
+        spatial_merge_size=4,  # 64 tokens
+        temporal_patch_size=1,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        dynamic_kv_cache=True,
+        image_prefix_tokens=("<fake_token_around_image>", "<global-img>"),
+        image_suffix_tokens=("<fake_token_around_image>",),
+        family="smolvlm",
+    ),
+    "smolvlm2-2.2b": VLMSpec(
+        short_name="smolvlm2-2.2b",
+        hf_model_id="HuggingFaceTB/SmolVLM2-2.2B-Instruct",
+        output_name="smolvlm2_2_2b",
+        image_token_id=49190,
+        image_size=384,  # SigLIP so400m-patch14-384: 27 x 27 patches
+        patch_size=14,
+        spatial_merge_size=3,  # (27/3)**2 = 81 tokens
+        temporal_patch_size=1,
+        image_mean=(0.5, 0.5, 0.5),
+        image_std=(0.5, 0.5, 0.5),
+        rescale_factor=1.0,
+        image_strategy="stretch",
+        dynamic_kv_cache=True,
+        image_prefix_tokens=("<fake_token_around_image>", "<global-img>"),
+        image_suffix_tokens=("<fake_token_around_image>",),
+        family="smolvlm",
+    ),
 }
 
 
@@ -135,13 +207,18 @@ def load_model_from_safetensors(
     max_ctx: int,
     num_layers: int | None,
     dtype: torch.dtype = torch.float16,
+    text_prefix: str = "model.language_model.",
+    extra_vision_prefixes: tuple[str, ...] = (),
 ) -> torch.nn.Module:
     """Load a VL text decoder directly from safetensors, bypassing from_hf_memory_efficient.
 
-    Handles two checkpoint layouts:
+    Handles the checkpoint layouts seen so far:
       - Qwen3-VL: ``model.language_model.*`` (text), ``model.visual.*`` (vision, skipped)
       - Muse Glimmer: ``model.language_model.*`` (text), ``model.vision_*`` (vision, skipped),
         plus a top-level ``lm_head.weight`` outside the language_model prefix.
+      - SmolVLM2: ``model.text_model.*`` (text; pass ``text_prefix="model.text_model."``),
+        ``model.vision_model.*`` / ``model.connector.*`` (vision, skipped via
+        ``extra_vision_prefixes``), plus a top-level ``lm_head.weight``.
     """
     # Set config
     text_cfg = model_class._get_reauthored_config(hf_config, max_ctx, num_layers)
@@ -151,13 +228,14 @@ def load_model_from_safetensors(
     model.to(dtype=dtype)
 
     # Build state dict from safetensors
-    prefix = "model.language_model."
+    prefix = text_prefix
     # Prefixes to skip (vision components from various checkpoint formats)
     vision_prefixes = (
         "model.visual.",
         "model.vision_tower.",
         "model.vision_adapter.",
         "model.vision_projection.",
+        *extra_vision_prefixes,
     )
     layer_pattern = re.compile(r"layers\.(\d+)\.")
     st_files = _get_safetensors_files(model_dir)
@@ -258,9 +336,21 @@ class EmbedTokensNormed(torch.nn.Module):
         return h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
 
 
-def _load_embed_weight(model_dir: str) -> torch.Tensor:
+def _resolve_token_ids(tokenizer, tokens: tuple[str, ...]) -> list[int]:
+    """Map special-token strings to ids, failing on any the tokenizer doesn't know."""
+    ids = []
+    for token in tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id == tokenizer.unk_token_id:
+            raise ValueError(f"tokenizer has no token {token!r}")
+        ids.append(token_id)
+    return ids
+
+
+def _load_embed_weight(
+    model_dir: str, embed_key: str = "model.language_model.embed_tokens.weight"
+) -> torch.Tensor:
     """Read the f16 embed_tokens weight table [vocab, hidden] from safetensors."""
-    embed_key = "model.language_model.embed_tokens.weight"
     for path in _get_safetensors_files(model_dir):
         with safe_open(path, framework="pt", device="cpu") as f:
             if embed_key in f.keys():  # noqa: SIM118 — safe_open has no __contains__
@@ -277,7 +367,12 @@ async def export_embed_model(
     include_debug_info: bool = DEFAULT_INCLUDE_DEBUG_INFO,
 ) -> str:
     """Export the token-embedding lookup as embed.aimodel (asset role `embedding`)."""
-    weight = _load_embed_weight(model_dir)
+    embed_key = (
+        "model.text_model.embed_tokens.weight"
+        if spec.family == "smolvlm"
+        else "model.language_model.embed_tokens.weight"
+    )
+    weight = _load_embed_weight(model_dir, embed_key)
     vocab_size, hidden_size = weight.shape
     if spec.short_name == "muse-glimmer-vl":
         module = EmbedTokensNormed(weight, eps=1e-5).eval()
@@ -354,8 +449,16 @@ async def export_text_bundle(
     logging.info("Loading model from safetensors (direct, skips vision encoder)...")
     if spec.short_name == "muse-glimmer-vl":
         model_class = MuseGlimmerForCausalLMEmbeddings
+        text_prefix = "model.language_model."
+        extra_vision_prefixes: tuple[str, ...] = ()
+    elif spec.family == "smolvlm":
+        model_class = SmolVLMForCausalLMEmbeddings
+        text_prefix = "model.text_model."
+        extra_vision_prefixes = ("model.vision_model.", "model.connector.")
     else:
         model_class = Qwen3VLForCausalLMEmbeddings
+        text_prefix = "model.language_model."
+        extra_vision_prefixes = ()
     model = load_model_from_safetensors(
         model_class=model_class,
         hf_config=raw_cfg,
@@ -363,6 +466,8 @@ async def export_text_bundle(
         max_ctx=max_ctx,
         num_layers=num_layers,
         dtype=torch.float16,
+        text_prefix=text_prefix,
+        extra_vision_prefixes=extra_vision_prefixes,
     )
     model = model.eval()
     logging.info("Model loaded.")
@@ -393,8 +498,28 @@ async def export_text_bundle(
     n_layers = num_layers or text_cfg.num_hidden_layers
     n_kv_heads = text_cfg.num_key_value_heads
     head_dim = getattr(text_cfg, "head_dim", text_cfg.hidden_size // text_cfg.num_attention_heads)
-    k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
-    v_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+
+    # A cache traced at the full context has nowhere to grow — Dim(min=max=n)
+    # is illegal — so only trace dynamically when there's headroom.
+    cache_seq_len = min(TRACE_KV_CACHE_SEQ_LEN, max_ctx)
+    use_dynamic_kv_cache = spec.dynamic_kv_cache and cache_seq_len < max_ctx
+
+    if use_dynamic_kv_cache:
+        # Trace the cache at a small fixed size and let it grow to max_ctx at
+        # runtime (bit-exact vs. a fixed-size cache — see SmolVLM2 handoff).
+        k_cache = torch.zeros(n_layers, 1, n_kv_heads, cache_seq_len, head_dim, dtype=torch.float16)
+        v_cache = torch.zeros(n_layers, 1, n_kv_heads, cache_seq_len, head_dim, dtype=torch.float16)
+        k_cache_shape: dict[int, torch.export.Dim] | None = {
+            KVCache.seq_len_dim(): torch.export.Dim("k_seq_len", min=cache_seq_len, max=max_ctx)
+        }
+        v_cache_shape: dict[int, torch.export.Dim] | None = {
+            KVCache.seq_len_dim(): torch.export.Dim("v_seq_len", min=cache_seq_len, max=max_ctx)
+        }
+    else:
+        k_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+        v_cache = torch.zeros(n_layers, 1, n_kv_heads, max_ctx, head_dim, dtype=torch.float16)
+        k_cache_shape = None  # fixed size
+        v_cache_shape = None
 
     reference_inputs = {
         "inputs_embeds": inputs_embeds,
@@ -405,8 +530,8 @@ async def export_text_bundle(
     dynamic_shapes = {
         "inputs_embeds": {1: torch.export.Dim("query_len", max=max_ctx - 2)},
         "position_ids": {1: torch.export.Dim("seq_pos", min=QUERY_LEN, max=max_ctx - 1)},
-        "k_cache": None,  # fixed size
-        "v_cache": None,
+        "k_cache": k_cache_shape,
+        "v_cache": v_cache_shape,
     }
 
     # ---- 5. Export (stateful KV: k_cache/v_cache surfaced as in-place states) ----
@@ -482,6 +607,13 @@ async def export_text_bundle(
             "model_definition": "torch",
         },
     }
+    if spec.image_prefix_tokens or spec.image_suffix_tokens:
+        metadata["vision"]["image_prefix_token_ids"] = _resolve_token_ids(
+            tokenizer, spec.image_prefix_tokens
+        )
+        metadata["vision"]["image_suffix_token_ids"] = _resolve_token_ids(
+            tokenizer, spec.image_suffix_tokens
+        )
     with open(bundle_path / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -744,6 +876,25 @@ async def export_vision_encoder(
         vision_model = MuseGlimmerVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
         # MuseGlimmerVisionModel.forward already returns [1, N, text_hidden]
         # so we only need the f16 cast wrapper (no unsqueeze needed).
+        export_module = CastF16VisionEncoder(vision_model).eval()
+        num_visual_tokens = spec.num_visual_tokens
+        pixel_shape = (1, 3, spec.image_size, spec.image_size)
+    elif spec.family == "smolvlm":
+        # SmolVLM2: SigLIP ViT with learned absolute position embeddings +
+        # pixel-shuffle connector. No rotary embeddings and no windowed
+        # attention, so this doesn't fit StaticVisionEncoder's Qwen-specific
+        # patchify/RoPE geometry — SmolVLMVisionModel implements it directly.
+        # Single-image only (num_frames=1): SmolVLM2's native multi-tile
+        # image-splitting preprocessing is not replicated here.
+        if num_frames != 1:
+            raise NotImplementedError(
+                "SmolVLM2 vision encoder currently supports single-image only "
+                f"(num_frames=1), got {num_frames}"
+            )
+        logging.info(f"Loading {spec.hf_model_id} vision encoder (SmolVLMVisionModel)...")
+        vision_model = SmolVLMVisionModel.from_pretrained(spec.hf_model_id, dtype=torch.float32)
+        # SmolVLMVisionModel.forward already returns [1, N, text_hidden] (f32);
+        # only the f16 cast wrapper is needed.
         export_module = CastF16VisionEncoder(vision_model).eval()
         num_visual_tokens = spec.num_visual_tokens
         pixel_shape = (1, 3, spec.image_size, spec.image_size)

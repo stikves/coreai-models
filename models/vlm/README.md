@@ -11,6 +11,9 @@ supported models are registered in its `SUPPORTED_MODELS` table.
 |------------|---------------------------|------------------------------------------|
 | `qwen3-vl` | `Qwen/Qwen3-VL-2B-Instruct` | 448×448 vision encoder, f16 text decoder |
 | `muse-glimmer-vl` | `meta-models/Muse-Glimmer-30B` | ViT-G/14 vision encoder, f16 text decoder |
+| `smolvlm2-256m` | `HuggingFaceTB/SmolVLM2-256M-Video-Instruct` | SigLIP-base-512 vision encoder, dynamic-KV f16 text decoder |
+| `smolvlm2-500m` | `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` | SigLIP-base-512 vision encoder, dynamic-KV f16 text decoder |
+| `smolvlm2-2.2b` | `HuggingFaceTB/SmolVLM2-2.2B-Instruct` | SigLIP-so400m-384 vision encoder, dynamic-KV f16 text decoder |
 
 ## Exporting
 
@@ -18,6 +21,7 @@ supported models are registered in its `SUPPORTED_MODELS` table.
 uv run coreai.vlm.export --list-models          # list supported VLMs
 uv run coreai.vlm.export qwen3-vl               # full bundle (text + vision)
 uv run coreai.vlm.export qwen3-vl --skip-vision # text decoder + embedding only
+uv run coreai.vlm.export smolvlm2-256m          # full bundle (text + vision); also smolvlm2-500m, smolvlm2-2.2b
 ```
 
 Options:

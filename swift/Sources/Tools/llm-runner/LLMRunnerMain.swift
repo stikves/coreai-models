@@ -1175,13 +1175,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         displayPrompt: String
     ) async throws {
         let imageTokenCount = embeddedInput.tokenCount
-        let imageTokenId = visionConfig.imageTokenId
         let vlmTokens: [Int32]
 
         if let chatTemplateTokens = try? buildVLMPromptFromChatTemplate(
             prompt: displayPrompt,
             imageTokenCount: imageTokenCount,
-            imageTokenId: imageTokenId,
+            visionConfig: visionConfig,
             tokenizer: tokenizer
         ) {
             vlmTokens = chatTemplateTokens
@@ -1191,7 +1190,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 "VLM prompt: no chat template found, using fallback USER/ASSISTANT format",
                 component: "VLM")
             var tokens = tokenizer.encode(text: "USER: ", addSpecialTokens: true).map { Int32($0) }
-            tokens.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
+            tokens.append(contentsOf: visionConfig.imageTokenRun(count: imageTokenCount))
             let suffix = "\n" + displayPrompt + "\nASSISTANT:"
             tokens.append(
                 contentsOf: tokenizer.encode(text: suffix, addSpecialTokens: false).map { Int32($0) })
@@ -1298,41 +1297,19 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     private func buildVLMPromptFromChatTemplate(
         prompt: String,
         imageTokenCount: Int,
-        imageTokenId: Int32,
+        visionConfig: VisionConfig,
         tokenizer: any Tokenizer
     ) throws -> [Int32]? {
-        // Use the tokenizer's applyChatTemplate with a multimodal message.
-        // The template should emit a single <image> token that we expand.
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
-        let templatedPrompt = "\(imageToken)\n\(prompt)"
+        // The template should emit a single image token, which is expanded into the model's
+        // image token run (prefix + imageTokenCount image tokens + suffix). Nil when the template
+        // produced no placeholder, so the caller falls back.
         guard
-            let tokens = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-                .prompt(templatedPrompt), tokenizer: tokenizer
-            )
+            let tokens = PromptUtils.applyImageChatTemplate(
+                text: prompt, imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer)
         else {
             return nil
         }
-
-        // Expand the single image placeholder to imageTokenCount copies
-        var result: [Int32] = []
-        result.reserveCapacity(tokens.count + imageTokenCount - 1)
-        var foundPlaceholder = false
-        for tokenInt in tokens {
-            let token = Int32(tokenInt)
-            if token == imageTokenId && !foundPlaceholder {
-                result.append(contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                foundPlaceholder = true
-            } else if token == imageTokenId {
-                // Skip additional single image tokens (already expanded the first one)
-                continue
-            } else {
-                result.append(token)
-            }
-        }
-
-        // If we never found the placeholder, the template didn't produce it — fall back
-        guard foundPlaceholder else { return nil }
-        return result
+        return visionConfig.expandImagePlaceholder(in: tokens, count: imageTokenCount)
     }
 
     // MARK: - Warmup

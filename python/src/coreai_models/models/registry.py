@@ -135,6 +135,7 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.macos.qwen3_vl import (
         Qwen3VLForCausalLM,
     )
+    from coreai_models.models.macos.smolvlm import SmolVLMForCausalLM
 
     return {
         "diffusion_gemma_text": ModelEntry(
@@ -205,6 +206,12 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=Qwen3_5ForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="model.language_model.",
+        ),
+        # SmolVLM2: text decoder only (input_ids). The VLM bundle is exported by
+        # coreai.vlm.export with SmolVLMForCausalLMEmbeddings + SmolVLMVisionModel.
+        "smolvlm": ModelEntry(
+            macos_class=SmolVLMForCausalLM,
+            hf_config_attr="text_config",
         ),
         # Qwen3-VL: vision-language model.
         # macos_class = standard text decoder (input_ids, for text-only use).

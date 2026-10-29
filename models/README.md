@@ -222,6 +222,7 @@ uv run models/<name>/export.py --include-debug-info   # embed debug information 
 ### Vision-Language Models (VLMs)
 
 - [Qwen3-VL](vlm)
+- [SmolVLM2](smolvlm2)
 
 ### Vision Models
 
