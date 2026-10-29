@@ -346,6 +346,29 @@ public enum Input: Sendable {
 
 /// Utility functions for prompt formatting
 public struct PromptUtils {
+    /// Applies the chat template to a single user turn holding one image placeholder followed by `text`.
+    ///
+    /// Plain string content (`"<image>\n<text>"`) is tried first, which is what most VLM templates expect.
+    /// If that render has no placeholder, typed content (`[{"type": "image"}, {"type": "text", ...}]`) is
+    /// tried, which templates such as SmolVLM's require. Returns nil when neither form yields a placeholder.
+    public static func applyImageChatTemplate(text: String, imageTokenId: Int32, tokenizer: any Tokenizer)
+        -> [Int32]?
+    {
+        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<image>"
+        let stringContent: [Message] = [["role": "user", "content": "\(imageToken)\n\(text)"]]
+        let typedContent: [Message] = [
+            ["role": "user", "content": [["type": "image"], ["type": "text", "text": text]] as [[String: String]]]
+        ]
+        for messages in [stringContent, typedContent] {
+            if let tokens = try? tokenizer.applyChatTemplate(messages: messages).map({ Int32($0) }),
+                tokens.contains(imageTokenId)
+            {
+                return tokens
+            }
+        }
+        return nil
+    }
+
     /// Apply chat template using tokenizer's built-in functionality
     /// This method tries to use the tokenizer's applyChatTemplate method, falling back to direct encoding
     public static func maybeApplyTokenizerChatTemplate(_ input: Input, tokenizer: any Tokenizer) throws
@@ -357,7 +380,19 @@ public struct PromptUtils {
         case .prompt(let prompt):
             // Try to use tokenizer's applyChatTemplate for proper chat formatting
             let messages = [["role": "user", "content": prompt]]
-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+            var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+
+            // Templates that render typed content only (SmolVLM) drop string content, so the render
+            // matches an empty turn; retry with [{"type": "text", ...}].
+            if !prompt.isEmpty,
+                let emptyTurn = try? tokenizer.applyChatTemplate(messages: [["role": "user", "content": ""]]),
+                emptyTurn == promptTokens
+            {
+                let typedContent: [Message] = [
+                    ["role": "user", "content": [["type": "text", "text": prompt]] as [[String: String]]]
+                ]
+                promptTokens = try tokenizer.applyChatTemplate(messages: typedContent)
+            }
 
             CLILogger.log(
                 "Applied chat template using tokenizer.applyChatTemplate()", component: "Tokenizer")

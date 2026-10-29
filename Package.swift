@@ -312,7 +312,8 @@ let package = Package(
             ],
             path: "swift/Tests/LanguageModelsTests",
             resources: [
-                .copy("Resources/MinimalTokenizer")
+                .copy("Resources/MinimalTokenizer"),
+                .copy("Resources/MinimalSmolVLMTokenizer"),
             ],
             swiftSettings: [
                 .enableExperimentalFeature("Lifetimes")

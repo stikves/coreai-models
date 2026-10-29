@@ -150,7 +150,7 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         let promptTokens = Self.buildPromptTokens(
             userText: userText,
             imageTokenCount: embeddedInput.tokenCount,
-            imageTokenId: visionConfig.imageTokenId,
+            visionConfig: visionConfig,
             tokenizer: tokenizer
         )
 
@@ -199,32 +199,17 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
     // MARK: - Prompt Construction
 
     /// Builds the token sequence for a single-image prompt.
-    private static func buildPromptTokens(
+    static func buildPromptTokens(
         userText: String,
         imageTokenCount: Int,
-        imageTokenId: Int32,
+        visionConfig: VisionConfig,
         tokenizer: any Tokenizer
     ) -> [Int32] {
-        let imageToken = tokenizer.convertIdToToken(Int(imageTokenId)) ?? "<|image_pad|>"
-        if let templated = try? PromptUtils.maybeApplyTokenizerChatTemplate(
-            .prompt("\(imageToken)\n\(userText)"), tokenizer: tokenizer)
+        if let templated = PromptUtils.applyImageChatTemplate(
+            text: userText, imageTokenId: visionConfig.imageTokenId, tokenizer: tokenizer),
+            let expanded = visionConfig.expandImagePlaceholder(in: templated, count: imageTokenCount)
         {
-            var result: [Int32] = []
-            result.reserveCapacity(templated.count + imageTokenCount)
-            var expanded = false
-            for tokenInt in templated {
-                let token = Int32(tokenInt)
-                if token == imageTokenId {
-                    if !expanded {
-                        result.append(
-                            contentsOf: [Int32](repeating: imageTokenId, count: imageTokenCount))
-                        expanded = true
-                    }
-                    continue
-                }
-                result.append(token)
-            }
-            if expanded { return result }
+            return expanded
         }
 
         // Fallback for tokenizers without a multimodal chat template. Uses the
