@@ -88,13 +88,13 @@ struct EngineFactoryVLMTests {
     }
 
     @Test("a separate-embedding VLM runs on the sequential engine and rejects other variants")
-    func resolvesVLMVariant() throws {
+    func validatesVLMVariant() throws {
         for override in [nil, "auto", "default", "coreai-sequential"] {
-            #expect(try EngineFactory.resolveVLMVariant(override: override) == .sequential)
+            try EngineFactory.validateVLMVariant(override)
         }
         for override in ["coreai-pipelined", "static-shape", "bogus"] {
             #expect(throws: InferenceRuntimeError.self) {
-                _ = try EngineFactory.resolveVLMVariant(override: override)
+                try EngineFactory.validateVLMVariant(override)
             }
         }
     }

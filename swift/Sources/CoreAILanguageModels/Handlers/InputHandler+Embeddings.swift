@@ -67,7 +67,7 @@ public struct EmbeddingsInputHandler: SyncInputHandler {
             CLILogger.log("  - scatter merge complete")
         }
 
-        // Build position_ids: [0, 1, ..., processedTokenCount + batchSize - 1]
+        // TODO: Build compact position_ids for all-sliding (ring) decoders, as TokenInputHandler does.
         let totalPositions = context.processedTokenCount + batchSize
         let resolvedPosDesc = positionIdsDescriptor.resolvingDynamicDimensions([1, totalPositions])
         var positionIds = NDArray(descriptor: resolvedPosDesc)
@@ -81,10 +81,10 @@ public struct EmbeddingsInputHandler: SyncInputHandler {
 
     // MARK: - Scatter Merge
 
-    /// Merge text embeddings with vision embeddings by replacing image placeholder positions.
+    /// Merge text embeddings with image embeddings by replacing the image placeholder rows.
     ///
-    /// Finds positions where `tokens[i] == imageTokenId` and copies the corresponding vision
-    /// embedding vectors into those positions. All other positions retain their text embeddings.
+    /// Copies image row `i` over the text row of the `i`-th `imageTokenId` in `tokens`. Throws unless
+    /// the placeholder count matches the image rows and both share a hidden size.
     ///
     /// - Parameters:
     ///   - textEmbeddings: Text token embeddings NDArray, shape `[1, seq_len, hidden_dim]`
@@ -98,9 +98,11 @@ public struct EmbeddingsInputHandler: SyncInputHandler {
         tokens: ArraySlice<Int32>,
         imageTokenId: Int32
     ) throws -> NDArray {
-        guard let hiddenDim = textEmbeddings.shape.last, hiddenDim > 0 else {
+        guard textEmbeddings.shape.count == 3, textEmbeddings.shape[1] == tokens.count,
+            let hiddenDim = textEmbeddings.shape.last, hiddenDim > 0
+        else {
             throw InferenceRuntimeError.invalidState(
-                "scatterMerge: text embeddings have invalid shape \(textEmbeddings.shape)")
+                "scatterMerge: text embeddings have shape \(textEmbeddings.shape) for \(tokens.count) tokens")
         }
 
         // Find image placeholder positions
@@ -113,34 +115,24 @@ public struct EmbeddingsInputHandler: SyncInputHandler {
 
         CLILogger.log("  - scatter merge: \(imagePositions.count) image positions, hidden_dim=\(hiddenDim)")
 
-        var merged = textEmbeddings
-        guard !imagePositions.isEmpty else { return merged }
-
         let expectedCount = imageEmbeddings.shape[1]
         guard imagePositions.count == expectedCount else {
             throw InferenceRuntimeError.invalidArgument(
                 "scatterMerge: found \(imagePositions.count) image placeholder tokens, "
                     + "expected \(expectedCount) from embeddings. Check prompt template.")
         }
-
-        let seqLen = textEmbeddings.shape[1]
-        let imgSeqLen = imageEmbeddings.shape[1]
-        guard imgSeqLen >= expectedCount else {
+        guard imageEmbeddings.shape.last == hiddenDim else {
             throw InferenceRuntimeError.invalidArgument(
-                "scatterMerge: image embeddings have \(imgSeqLen) tokens, need \(expectedCount)")
+                "scatterMerge: image embeddings have hidden size \(imageEmbeddings.shape.last ?? 0), "
+                    + "text embeddings \(hiddenDim)")
         }
 
-        // Validate all positions are within bounds
-        guard let maxPos = imagePositions.last, maxPos < seqLen else {
-            throw InferenceRuntimeError.invalidArgument(
-                "scatterMerge: image position \(imagePositions.last ?? -1) exceeds sequence length \(seqLen)")
-        }
-
-        // Copy image embeddings into placeholder positions.
         guard imageEmbeddings.scalarType == .float16 else {
             throw InferenceRuntimeError.invalidInputType(
                 "scatterMerge only supports float16 embeddings; got \(imageEmbeddings.scalarType)")
         }
+
+        var merged = textEmbeddings
         imageEmbeddings.view(as: Float16.self).withUnsafePointer { imgPtr, _, _ in
             let mutableView = merged.mutableView(as: Float16.self)
             mutableView.withUnsafeMutablePointer { mergedPtr, _, _ in

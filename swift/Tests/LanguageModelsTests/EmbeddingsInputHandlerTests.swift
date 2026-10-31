@@ -38,16 +38,16 @@ struct EmbeddingsInputHandlerTests {
         #expect(rows(of: merged) == [[1, 1], [70, 71], [80, 81], [4, 4], [5, 5]])
     }
 
-    @Test("scatterMerge passes a text-only sequence through unchanged")
-    func textOnlyUnchanged() throws {
+    @Test("scatterMerge rejects a prompt with no image placeholders")
+    func noPlaceholdersThrows() {
         let text = embeddings([[1, 1], [2, 2], [3, 3]])
         let image = embeddings([[70, 71]])
         let tokens: [Int32] = [5, 6, 7]
 
-        let merged = try EmbeddingsInputHandler.scatterMerge(
-            textEmbeddings: text, imageEmbeddings: image, tokens: tokens[...], imageTokenId: imageTokenId)
-
-        #expect(rows(of: merged) == [[1, 1], [2, 2], [3, 3]])
+        #expect(throws: InferenceRuntimeError.self) {
+            _ = try EmbeddingsInputHandler.scatterMerge(
+                textEmbeddings: text, imageEmbeddings: image, tokens: tokens[...], imageTokenId: imageTokenId)
+        }
     }
 
     @Test("scatterMerge indexes positions from the start of a non-zero-based slice")
@@ -67,6 +67,18 @@ struct EmbeddingsInputHandlerTests {
         let text = embeddings([[1, 1], [2, 2], [3, 3]])
         let image = embeddings([[70, 71], [80, 81]])
         let tokens: [Int32] = [5, imageTokenId, 7]
+
+        #expect(throws: InferenceRuntimeError.self) {
+            _ = try EmbeddingsInputHandler.scatterMerge(
+                textEmbeddings: text, imageEmbeddings: image, tokens: tokens[...], imageTokenId: imageTokenId)
+        }
+    }
+
+    @Test("scatterMerge rejects image embeddings of a different hidden size")
+    func hiddenSizeMismatchThrows() {
+        let text = embeddings([[1, 1], [2, 2]])
+        let image = NDArray(shape: [1, 1, 3], scalarType: .float16)
+        let tokens: [Int32] = [5, imageTokenId]
 
         #expect(throws: InferenceRuntimeError.self) {
             _ = try EmbeddingsInputHandler.scatterMerge(

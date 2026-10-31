@@ -152,7 +152,7 @@ extension InputLayout {
 
     /// Resolve an embeddings-input decoder's two inputs (vision-language models): by name when
     /// the export uses a known one, otherwise by position, embeddings first.
-    public static func resolveEmbeddingsInputs(
+    static func resolveEmbeddingsInputs(
         inputNames: [String]
     ) throws -> (embeddings: String, positionIds: String) {
         guard inputNames.count == 2 else {

@@ -35,10 +35,15 @@ enum PrefillStrategy {
 /// ## Vision-language models
 ///
 /// Built from a separate-embedding `kind=vlm` bundle, the engine also owns a `VisionFrontEnd`
-/// (vision encoder + projector) and an `EmbeddingsInputHandler` that runs `embed_tokens` and
-/// scatter-merges image embeddings over the image placeholder tokens on prefill. Prefix reuse
-/// stops at the first image placeholder. Without vision components, the multimodal entry
-/// points throw.
+/// (vision encoder + projector) and an `EmbeddingsInputHandler` that runs `embed_tokens` on every
+/// step and, on the multimodal prefill, scatter-merges the image embeddings over the image
+/// placeholder tokens.
+///
+/// A multimodal request reuses the cached prefix up to its first image placeholder and prefills
+/// the rest; its embeddings cover every placeholder in its tokens. A text-only request reuses the
+/// cached prefix, images included, and throws when its tokens hold an image placeholder past that
+/// prefix. A hybrid model with recurrent state replays the prompt from the start instead of
+/// rewinding. Without vision components, the multimodal entry points throw.
 public final class CoreAISequentialEngine: MultimodalInferenceEngine, IdempotentEngine, BatchedDecodeStep,
     @unchecked Sendable
 {
@@ -215,11 +220,16 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         if let vision {
             // Vision-language decoder: token embeddings in, from `embed_tokens` plus the image
             // scatter-merge in the input handler.
+            // TODO: Reject or support decoders with an engine-managed sliding ring; this path has no ring handling.
             let names = try InputLayout.resolveEmbeddingsInputs(inputNames: descriptor.inputNames)
             self.logitsName = InputLayout.resolveLogitsName(from: descriptor.outputNames)
 
-            guard case .ndArray = descriptor.inputDescriptor(of: names.embeddings) else {
+            guard case .ndArray(let embeddingsDesc) = descriptor.inputDescriptor(of: names.embeddings) else {
                 throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(names.embeddings)'")
+            }
+            guard embeddingsDesc.scalarType == .float16 else {
+                throw InferenceRuntimeError.invalidInputType(
+                    "Only float16 '\(names.embeddings)' supported, got \(embeddingsDesc.scalarType)")
             }
             guard case .ndArray(let posIdsDesc) = descriptor.inputDescriptor(of: names.positionIds) else {
                 throw InferenceRuntimeError.invalidInputType("Cannot get descriptor for '\(names.positionIds)'")
@@ -242,6 +252,12 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
                 embedModel.functionDescriptor(for: "embed_tokens") != nil ? "embed_tokens" : "main"
             guard let embedDesc = embedModel.functionDescriptor(for: embedFunctionName) else {
                 throw InferenceRuntimeError.functionNotFound("embed_tokens (tried 'embed_tokens' and 'main')")
+            }
+            guard let embedOutputName = embedDesc.outputNames.first,
+                case .ndArray(let embedOutputDesc) = embedDesc.outputDescriptor(of: embedOutputName),
+                embedOutputDesc.scalarType == .float16
+            else {
+                throw InferenceRuntimeError.invalidOutputType("Only float16 \(embedFunctionName) output supported")
             }
             guard let embedFn = try embedModel.loadFunction(named: embedFunctionName) else {
                 throw InferenceRuntimeError.functionNotFound(embedFunctionName)
@@ -498,6 +514,14 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         package let decodeSeconds: Double
     }
 
+    /// Throws for a vision-language decoder, whose graph takes embeddings, not token IDs.
+    private func requireBatchableDecoder() throws {
+        guard visionFrontEnd == nil else {
+            throw InferenceRuntimeError.invalidState(
+                "Batched decode does not support vision-language models (\(config.name))")
+        }
+    }
+
     /// Prefills and decodes `N` equal-length prompts in lockstep on a new batch=N session, sampling
     /// each row with its own entry in `configs`.
     ///
@@ -513,6 +537,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         maxNewTokens: Int,
         eosTokenIds: Set<Int32>
     ) async throws -> BatchedRunResult {
+        try requireBatchableDecoder()
         precondition(!promptRows.isEmpty && promptRows.count == configs.count)
         let n = promptRows.count
         let promptLen = promptRows[0].count
@@ -611,6 +636,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         startPositions: [Int],
         session: GenerationSessionState
     ) async throws -> NDArray {
+        try requireBatchableDecoder()
         precondition(!tokensPerRow.isEmpty, "a batched forward requires at least one row")
         let n = tokensPerRow.count
         precondition(startPositions.count == n, "one start position per row")
@@ -703,6 +729,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
         promptTokens: [Int32],
         session: GenerationSessionState
     ) async throws -> [LogitsScalarType] {
+        try requireBatchableDecoder()
         precondition(!promptTokens.isEmpty, "prefillRow requires a non-empty prompt")
         guard let target = session.kvCache as? GrowingNDArrayState else {
             throw InferenceRuntimeError.invalidState(
@@ -867,7 +894,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     // MARK: - Multimodal Prefill
 
     /// Run the multimodal prefill: embed `tokens`, scatter-merge the image embeddings over their
-    /// placeholders, and decode, in one forward pass.
+    /// placeholders, and run the decoder, in one forward pass.
     ///
     /// - Parameters:
     ///   - embeddedInput: Image or video embeddings from `encodeImage` / `encodeVideo`
@@ -891,6 +918,7 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
 
         CLILogger.log("VLM prefill: \(tokens.count) tokens")
 
+        // TODO: Split the image prefill into ring-bounded steps for sliding-ring decoders.
         return try await processTokenBatch(
             tokens, logits: .lastPosition, imageEmbeddings: embeddedInput.embeddings, sessionState: sessionState)
     }
@@ -953,9 +981,9 @@ public final class CoreAISequentialEngine: MultimodalInferenceEngine, Idempotent
     /// Generate tokens from a token sequence with embedded image regions, on the engine's
     /// internal session.
     ///
-    /// The first forward pass embeds the tokens not already in the KV cache, scatter-merges the
-    /// image embeddings at the placeholder positions, and runs the decoder. Later steps are
-    /// standard token-by-token decode.
+    /// Reuses the cached prefix up to the first image placeholder. The prefill embeds the remaining
+    /// tokens, scatter-merges `input` over their image placeholders, and runs the decoder; later steps
+    /// decode token by token. `input` holds the embeddings of every image placeholder in `tokens`.
     public func generate(
         with input: InputEmbeddings,
         tokens: [TokenId],
@@ -1074,7 +1102,7 @@ extension CoreAISequentialEngine {
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
-        startGeneration(
+        try startGeneration(
             input: input,
             embeddedInput: nil,
             sessionState: sessionState,
@@ -1091,7 +1119,7 @@ extension CoreAISequentialEngine {
         inferenceOptions: InferenceOptions
     ) async throws -> GenerationSequence {
         _ = try requireVisionFrontEnd()
-        return startGeneration(
+        return try startGeneration(
             input: tokens,
             embeddedInput: embeddedInput,
             sessionState: sessionState,
@@ -1105,35 +1133,25 @@ extension CoreAISequentialEngine {
         sessionState: GenerationSessionState,
         samplingConfiguration: SamplingConfiguration,
         inferenceOptions: InferenceOptions
-    ) -> GenerationSequence {
+    ) throws -> GenerationSequence {
+        // Implicit prefix caching against the session history. A fresh session reports a hit count of 0.
+        let plan = try Self.generationResetPlan(
+            tokens: input,
+            commonPrefix: sessionState.history.resolve(input: input).commonPrefix,
+            isMultimodal: embeddedInput != nil,
+            imageTokenId: visionConfig?.imageTokenId,
+            historyCount: sessionState.history.count,
+            processedTokenCount: sessionState.processedTokenCount,
+            hasNonTruncatableStates: sessionState.hasNonTruncatableStates,
+            ringCapacity: slidingRingCapacity)
+
         // Cancel an earlier generation on this session only. Other sessions keep running.
         sessionState.tokenBox.cancelActive()
-
-        // Implicit prefix caching: resolve input against history, up to the first image
-        // placeholder.
-        // For hybrid models with recurrent states, we must full-reset on any
-        // rewind because recurrent state summarizes the whole prefix and cannot
-        // be truncated by moving a KV cursor. Future: checkpoint/restore.
-        // Default to 0 so a fresh session (no history) always reports a clean
-        // value instead of leaking the previous session's hit count.
-        sessionState.lastPrefixHitCount = 0
-        if sessionState.history.count > 0 {
-            let (commonPrefix, _) = sessionState.history.resolve(input: input)
-            let plan = Self.prefixResetPlan(
-                commonPrefix: Self.reusablePrefix(
-                    commonPrefix: commonPrefix, tokens: input, imageTokenId: visionConfig?.imageTokenId),
-                historyCount: sessionState.history.count,
-                processedTokenCount: sessionState.processedTokenCount,
-                inputCount: input.count,
-                hasNonTruncatableStates: sessionState.hasNonTruncatableStates,
-                ringCapacity: slidingRingCapacity
-            )
-            if let resetTo = plan.resetTo {
-                internalReset(to: resetTo, sessionState: sessionState)
-            }
-            sessionState.lastPrefixHitCount = plan.prefixHitCount
+        if let resetTo = plan.resetTo {
+            internalReset(to: resetTo, sessionState: sessionState)
         }
-        lastPrefixHitCount = sessionState.lastPrefixHitCount
+        sessionState.lastPrefixHitCount = plan.prefixHitCount
+        lastPrefixHitCount = plan.prefixHitCount
 
         let token = GenerationToken()
         sessionState.tokenBox.install(token)
@@ -1148,14 +1166,55 @@ extension CoreAISequentialEngine {
         )
     }
 
-    /// The part of the `commonPrefix`-token match against history whose cached KV may be reused:
-    /// the match, cut at the first image placeholder in it. `imageTokenId` is `nil` for a text
-    /// model.
-    static func reusablePrefix(commonPrefix: Int, tokens: [Int32], imageTokenId: Int32?) -> Int {
-        guard let imageTokenId, let firstImage = tokens.prefix(commonPrefix).firstIndex(of: imageTokenId) else {
-            return commonPrefix
+    /// Prefix-cache plan for a request of `tokens` whose first `commonPrefix` match the session
+    /// history. `imageTokenId` is `nil` for a text model.
+    ///
+    /// A vision-language session follows `visionPrefixResetPlan`, cutting the match at the first
+    /// image placeholder for a multimodal request. A text-only request throws when `tokens` hold
+    /// an image placeholder at or past the position it resumes from, since that image is not in
+    /// the KV cache.
+    static func generationResetPlan(
+        tokens: [Int32],
+        commonPrefix: Int,
+        isMultimodal: Bool,
+        imageTokenId: Int32?,
+        historyCount: Int,
+        processedTokenCount: Int,
+        hasNonTruncatableStates: Bool,
+        ringCapacity: Int? = nil
+    ) throws -> (resetTo: Int?, prefixHitCount: Int) {
+        var plan: (resetTo: Int?, prefixHitCount: Int) = (nil, 0)
+        if historyCount > 0 {
+            if let imageTokenId {
+                plan = visionPrefixResetPlan(
+                    reusablePrefix: isMultimodal
+                        ? reusablePrefix(commonPrefix: commonPrefix, tokens: tokens, imageTokenId: imageTokenId)
+                        : commonPrefix,
+                    historyCount: historyCount, processedTokenCount: processedTokenCount, inputCount: tokens.count,
+                    hasNonTruncatableStates: hasNonTruncatableStates, ringCapacity: ringCapacity)
+            } else {
+                plan = prefixResetPlan(
+                    commonPrefix: commonPrefix, historyCount: historyCount, processedTokenCount: processedTokenCount,
+                    inputCount: tokens.count, hasNonTruncatableStates: hasNonTruncatableStates,
+                    ringCapacity: ringCapacity)
+            }
         }
-        return firstImage
+        let resumeAt = plan.resetTo ?? processedTokenCount
+        if !isMultimodal, let imageTokenId, tokens.dropFirst(resumeAt).contains(imageTokenId) {
+            throw InferenceRuntimeError.invalidArgument(
+                "The prompt has image placeholder tokens from position \(resumeAt) on that are not in the KV cache. "
+                    + "Pass the image with generate(with:tokens:samplingConfiguration:inferenceOptions:).")
+        }
+        return plan
+    }
+
+    // TODO: Share prefix cutting, image loading and scatter-merge with StaticShapeEngine+Multimodal.
+    /// The length of the history match a multimodal request reuses: `commonPrefix`, cut at the
+    /// first image placeholder in `tokens`. Placeholder tokens are the same for every image, so a
+    /// match past one says nothing about the image behind it. The request's own embeddings cover
+    /// every placeholder from there on.
+    static func reusablePrefix(commonPrefix: Int, tokens: [Int32], imageTokenId: Int32) -> Int {
+        tokens.prefix(commonPrefix).firstIndex(of: imageTokenId) ?? commonPrefix
     }
 
     /// Pure decision for the implicit prefix-cache routing in `generate(with:sessionState:)`.
@@ -1198,6 +1257,33 @@ extension CoreAISequentialEngine {
         } else {
             return (nil, commonPrefix)
         }
+    }
+
+    /// Prefix-cache plan for a vision-language session.
+    ///
+    /// `reusablePrefix` is the history match, cut at its first image placeholder for a multimodal
+    /// request. A request with tokens past a `reusablePrefix` shorter than the history rewinds to
+    /// `reusablePrefix`, keeping the cached KV before it, images included. A hybrid session resets to
+    /// 0 instead, as does a rewind past a wrapped sliding ring. Every other request follows
+    /// `prefixResetPlan`.
+    static func visionPrefixResetPlan(
+        reusablePrefix: Int,
+        historyCount: Int,
+        processedTokenCount: Int,
+        inputCount: Int,
+        hasNonTruncatableStates: Bool,
+        ringCapacity: Int? = nil
+    ) -> (resetTo: Int?, prefixHitCount: Int) {
+        guard reusablePrefix < historyCount, reusablePrefix < inputCount, !hasNonTruncatableStates else {
+            return prefixResetPlan(
+                commonPrefix: reusablePrefix, historyCount: historyCount, processedTokenCount: processedTokenCount,
+                inputCount: inputCount, hasNonTruncatableStates: hasNonTruncatableStates, ringCapacity: ringCapacity)
+        }
+        guard reusablePrefix > 0,
+            StateHandlerFactory.ringRewindIsSafe(
+                from: processedTokenCount, to: reusablePrefix, ringCapacity: ringCapacity)
+        else { return (0, 0) }
+        return (reusablePrefix, reusablePrefix)
     }
 }
 
@@ -1302,8 +1388,9 @@ extension CoreAISequentialEngine.GenerationSequence {
             }
 
             // First call with forcedContinuation + logits: batch-process all tokens at once.
-            // Token input only: image embeddings need the multimodal prefill.
-            if let forced = loop.forcedContinuation, loop.returnsLogits, loop.step == 0, embeddedInput == nil {
+            // Vision-language decoders score one forced token per step instead: a row of their
+            // batched prefill can depend on the tokens after it.
+            if let forced = loop.forcedContinuation, loop.returnsLogits, loop.step == 0, engine.visionFrontEnd == nil {
                 return try await batchedForcedContinuation(forced)
             }
 
@@ -1344,41 +1431,44 @@ extension CoreAISequentialEngine.GenerationSequence {
             }
         }
 
-        /// Process the prompt plus every forced token in one prefill, buffer the logits that
-        /// predict each forced token, and yield the first.
+        /// Process the uncached prompt tokens plus every forced token in one prefill, buffer the
+        /// logits that predict each forced token, and yield the first.
         private func batchedForcedContinuation(
             _ forced: [CoreAISequentialEngine.TokenId]
         ) async throws -> InferenceOutput {
             let inputTokens = loop.inputTokens
-            let allTokens = inputTokens + forced.map { $0 }
+            let cached = sessionState.processedTokenCount
+            guard cached < inputTokens.count else {
+                throw InferenceRuntimeError.invalidState("No new tokens to process")
+            }
+            let newTokens = (inputTokens + forced)[cached...]
             let vocabSize = engine.config.vocabSize
 
             let allLogits: [LogitsScalarType]
-            let strategy = engine.selectPrefillStrategy(newTokenCount: allTokens.count)
+            let strategy = engine.selectPrefillStrategy(newTokenCount: newTokens.count)
             switch strategy {
             case .chunked(let chunkSize):
                 allLogits = try await engine.processChunkedPromptAllLogits(
-                    tokens: allTokens[...], chunkSize: chunkSize, sessionState: sessionState)
+                    tokens: newTokens, chunkSize: chunkSize, sessionState: sessionState)
             case .wholeBatch:
                 allLogits = try await engine.processChunkedPromptAllLogits(
-                    tokens: allTokens[...], chunkSize: allTokens.count, sessionState: sessionState)
+                    tokens: newTokens, chunkSize: newTokens.count, sessionState: sessionState)
             case .oneAtATime:
                 var collected: [LogitsScalarType] = []
-                for j in allTokens.indices {
+                for j in newTokens.indices {
                     collected.append(
                         contentsOf: try await engine.processTokenBatch(
-                            allTokens[j...j], logits: .allPositions, sessionState: sessionState))
+                            newTokens[j...j], logits: .allPositions, sessionState: sessionState))
                 }
                 allLogits = collected
             }
 
-            // Split into per-position logit vectors.
-            // Skip the prompt positions (inputTokens.count - 1 positions);
-            // we want logits that predict each forced token.
-            let promptLen = inputTokens.count
+            // Row `r` of `allLogits` predicts the token after position `cached + r`; keep the rows
+            // that predict each forced token.
+            let firstRow = inputTokens.count - 1 - cached
             var buffer: [[LogitsScalarType]] = []
             for i in 0..<forced.count {
-                let offset = (promptLen - 1 + i) * vocabSize
+                let offset = (firstRow + i) * vocabSize
                 let endOffset = offset + vocabSize
                 guard endOffset <= allLogits.count else {
                     throw InferenceRuntimeError.invalidState(
@@ -1388,8 +1478,7 @@ extension CoreAISequentialEngine.GenerationSequence {
             }
             batchedLogitsBuffer = buffer
 
-            // Update engine state
-            sessionState.history.append(contentsOf: allTokens[...])
+            sessionState.history.append(contentsOf: newTokens)
 
             // Yield first result
             let logits = buffer[loop.step]

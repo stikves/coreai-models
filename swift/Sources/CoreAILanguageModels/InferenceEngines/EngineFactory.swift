@@ -190,7 +190,7 @@ public struct EngineFactory: Sendable {
         languageModelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {
-        _ = try resolveVLMVariant(override: options.variant)
+        try validateVLMVariant(options.variant)
         let vlmConfig = try makeVLMConfig(
             bundle: bundle, languageModelURL: languageModelURL, options: options)
 
@@ -213,12 +213,12 @@ public struct EngineFactory: Sendable {
         )
     }
 
-    /// Resolves the variant override for a separate-embedding VLM. Auto-detection and
-    /// `coreai-sequential` select the sequential engine; any other variant throws
+    /// Checks the variant override for a separate-embedding VLM, which runs only on the sequential
+    /// engine. Auto-detection and `coreai-sequential` pass; any other variant throws
     /// `unsupportedEngineVariant`.
-    static func resolveVLMVariant(override: String?) throws -> Variant {
+    static func validateVLMVariant(_ override: String?) throws {
         guard let override, override != "auto", override != "default" else {
-            return .sequential
+            return
         }
         guard let variant = Variant(rawValue: override) else {
             throw InferenceRuntimeError.unsupportedEngineVariant(
@@ -229,7 +229,6 @@ public struct EngineFactory: Sendable {
                 "Variant '\(override)' does not run separate-embedding vision-language models; "
                     + "use coreai-sequential")
         }
-        return variant
     }
 
     // MARK: - Config Parsing

@@ -423,8 +423,8 @@ public enum InferenceRuntimeError: Error, LocalizedError {
 ///
 /// The caller owns the embeddings and decides caching strategy.
 public protocol MultimodalInferenceEngine: InferenceEngine {
-    /// Whether this engine instance accepts image and video input. A conforming engine built from
-    /// a text bundle (such as `CoreAISequentialEngine`) reports `false`.
+    /// Whether this engine instance accepts image and video input. An engine built from a text
+    /// bundle reports false.
     var acceptsMultimodalInput: Bool { get }
 
     /// Encode an image into embeddings suitable for injection into the VLM.
@@ -441,8 +441,10 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
     func encodeVideo(_ video: VideoInput) async throws -> InputEmbeddings
 
     /// Generate tokens from a token sequence with embedded image regions.
-    /// The engine scatter-merges `input.embeddingPositions` with the embedded data
-    /// during prefill, then continues standard autoregressive decode.
+    ///
+    /// The engine scatter-merges `input` over the image placeholder tokens during prefill, then
+    /// continues standard autoregressive decode. `input` holds the embeddings of every image
+    /// placeholder in `tokens`, in order.
     func generate(
         with input: InputEmbeddings,
         tokens: [TokenId],
@@ -450,14 +452,6 @@ public protocol MultimodalInferenceEngine: InferenceEngine {
         inferenceOptions: InferenceOptions
     ) async throws -> OutputSequence
 }
-
-extension MultimodalInferenceEngine {
-    public var acceptsMultimodalInput: Bool { true }
-}
-
-// TODO: Multi-turn — caller can cache InputEmbeddings across turns and pass it
-// again with the accumulated token context. Engine keeps image in KV cache
-// via reset(to:) preserving the prefill portion.
 
 // MARK: - Engine Options
 

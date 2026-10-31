@@ -15,8 +15,8 @@ import CoreAI
 ///
 /// `CoreAISequentialEngine` passes `heldBack = prefillHeldBackTokens(hasPrefillGraph:)` and a
 /// closure that routes non-held-back chunks through the prefill graph (returning `[]`) when one
-/// exists, otherwise through `main`. Without a prefill graph (every vision-language decoder
-/// today) nothing is held back and the loop is a plain chunked pass.
+/// exists, otherwise through `main`. Without a prefill graph nothing is held back and the loop is
+/// a plain chunked pass.
 func runChunkedPrefill(
     tokens: ArraySlice<Int32>,
     chunkSize: Int,

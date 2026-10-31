@@ -12,16 +12,7 @@ import Tokenizers
 
 // MARK: - VLM Session Parity (on-device, requires a compiled VLM bundle)
 
-/// Model-backed checks for vision-language generation on `CoreAISequentialEngine` sessions and
-/// its prefix-cache rule (reuse stops at the first image placeholder).
-///
-/// Gated on environment variables because they need a compiled VLM bundle:
-///
-///   VLM_PARITY_BUNDLE — path to a separate-embedding VLM bundle directory (metadata.json kind=vlm)
-///   VLM_PARITY_IMAGE  — path to an image file
-///
-/// Results are also printed (`VLM_PARITY …` lines) so on-device runs can be compared across
-/// machines and models.
+/// Bundle and image paths from the environment, and the prompts the tests use.
 private enum VLMParityFixture {
     static let bundlePath = ProcessInfo.processInfo.environment["VLM_PARITY_BUNDLE"]
     static let imagePath = ProcessInfo.processInfo.environment["VLM_PARITY_IMAGE"]
@@ -33,6 +24,18 @@ private enum VLMParityFixture {
     static let followUpText = "\nWhich colors stand out the most?"
 }
 
+/// Model-backed checks for vision-language generation on `CoreAISequentialEngine` sessions and
+/// its prefix-cache rule (a multimodal request rewinds to its first image placeholder; a text-only
+/// follow-up continues on the cached image).
+///
+/// Gated on environment variables because they need a compiled VLM bundle:
+///
+///   VLM_PARITY_BUNDLE — path to a separate-embedding VLM bundle directory (metadata.json kind=vlm)
+///   VLM_PARITY_IMAGE  — path to an image file
+///
+/// A rewound session's logits are printed (`VLM_PARITY …` lines), not asserted equal to a fresh
+/// session's: its cached prefix was computed in a different prefill batch, or token by token during
+/// decode, and this model's numerics depend on the batch.
 @Suite(
     "VLM session parity (on-device)",
     .serialized,
@@ -55,7 +58,7 @@ struct VLMSessionParityTests {
         let bundle = try LanguageModelBundle(at: URL(fileURLWithPath: VLMParityFixture.bundlePath!))
         let visionConfig = try #require(bundle.visionConfig, "Fixture must be a VLM bundle")
         let engine = try #require(
-            try await EngineFactory.createEngine(bundle: bundle) as? CoreAISequentialEngine,
+            try await CoreAIRunner(bundle: bundle).makeInferenceEngine() as? CoreAISequentialEngine,
             "Fixture must resolve to CoreAISequentialEngine")
         #expect(engine.acceptsMultimodalInput)
         let tokenizer = try await bundle.loadTokenizer()
@@ -102,22 +105,34 @@ struct VLMSessionParityTests {
         InferenceOptions(maxTokens: VLMParityFixture.steps, logits: .lastPosition)
     }
 
+    /// Runs a multimodal request. `resumesAt` is the KV position the session must resume from,
+    /// checked before the first step.
     private func multimodal(
-        _ tokens: [Int32], image: InputEmbeddings? = nil, session: GenerationSessionState, fixture: Fixture
+        _ tokens: [Int32], image: InputEmbeddings? = nil, session: GenerationSessionState, resumesAt: Int? = nil,
+        fixture: Fixture
     ) async throws -> Run {
-        try await collect(
-            fixture.engine.generate(
-                with: image ?? fixture.image, tokens: tokens, sessionState: session,
-                samplingConfiguration: .greedy, inferenceOptions: options))
+        let sequence = try await fixture.engine.generate(
+            with: image ?? fixture.image, tokens: tokens, sessionState: session,
+            samplingConfiguration: .greedy, inferenceOptions: options)
+        if let resumesAt { #expect(session.processedTokenCount == resumesAt) }
+        return try await collect(sequence)
     }
 
+    /// Runs a text-only request. `resumesAt` is checked as in `multimodal`.
     private func textOnly(
-        _ tokens: [Int32], session: GenerationSessionState, fixture: Fixture
+        _ tokens: [Int32], session: GenerationSessionState, resumesAt: Int? = nil,
+        inferenceOptions: InferenceOptions? = nil, fixture: Fixture
     ) async throws -> Run {
-        try await collect(
-            fixture.engine.generate(
-                with: tokens, sessionState: session,
-                samplingConfiguration: .greedy, inferenceOptions: options))
+        let sequence = try await fixture.engine.generate(
+            with: tokens, sessionState: session,
+            samplingConfiguration: .greedy, inferenceOptions: inferenceOptions ?? options)
+        if let resumesAt { #expect(session.processedTokenCount == resumesAt) }
+        return try await collect(sequence)
+    }
+
+    /// Length of the shared prefix of `a` and `b`.
+    private func sharedPrefix(_ a: [Int32], _ b: [Int32]) -> Int {
+        zip(a, b).prefix { $0 == $1 }.count
     }
 
     /// A solid-color image, distinct from the fixture image.
@@ -176,8 +191,8 @@ struct VLMSessionParityTests {
         fixture.tokenizer.decode(tokens: tokens.map(Int.init)).replacingOccurrences(of: "\n", with: "\\n")
     }
 
-    @Test("AT-MULTITURN: a templated second turn on a used session equals a fresh session")
-    func multiturnTemplatedMatchesFresh() async throws {
+    @Test("a templated second turn on a used session rewinds to the image")
+    func multiturnTemplatedRewinds() async throws {
         let fixture = try await makeFixture()
         let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
         let session = try fixture.engine.makeSessionState()
@@ -189,22 +204,18 @@ struct VLMSessionParityTests {
                 ["role": "assistant", "content": fixture.tokenizer.decode(tokens: answer1.tokens.map(Int.init))],
                 ["role": "user", "content": VLMParityFixture.question2],
             ], fixture: fixture)
-        let reused = try await multimodal(turn2, session: session, fixture: fixture)
+        let start = try imageStart(of: turn2, fixture)
+        let reused = try await multimodal(turn2, session: session, resumesAt: start, fixture: fixture)
         let hit = fixture.engine.lastPrefixHitCount
         let fresh = try await multimodal(turn2, session: try fixture.engine.makeSessionState(), fixture: fixture)
-        let start = try imageStart(of: turn2, fixture)
 
         print("VLM_PARITY turn1: \(decode(answer1.tokens, fixture))")
         print("VLM_PARITY templated-turn2 prefixHit=\(hit)/\(turn2.count) \(compare(reused, fresh))")
-        // Reuse stops at the image, so the used session re-prefills and matches a fresh one bit for bit.
-        #expect(hit <= start)
-        #expect(reused.tokens == fresh.tokens)
-        #expect(reused.logits == fresh.logits)
-        #expect(!reused.tokens.isEmpty)
+        #expect(hit == start)
     }
 
-    @Test("AT-MULTITURN: the same image extended with follow-up text equals a fresh session")
-    func multiturnSameImageMatchesFresh() async throws {
+    @Test("the same image extended with follow-up text rewinds to the image")
+    func multiturnSameImageRewinds() async throws {
         let fixture = try await makeFixture()
         let followUp = fixture.tokenizer.encode(text: VLMParityFixture.followUpText, addSpecialTokens: false)
             .map(Int32.init)
@@ -214,15 +225,14 @@ struct VLMSessionParityTests {
         let session = try fixture.engine.makeSessionState()
         let answer1 = try await multimodal(turn1, session: session, fixture: fixture)
 
-        // An exact extension of turn 1: every token matches, and reuse is still cut at the image.
+        // An exact extension of turn 1: reuse is cut at the image, and the session rewinds there.
         let extended = turn1 + answer1.tokens + followUp
-        let reused = try await multimodal(extended, session: session, fixture: fixture)
-        #expect(fixture.engine.lastPrefixHitCount == start)
+        let reused = try await multimodal(extended, session: session, resumesAt: start, fixture: fixture)
+        let hit = fixture.engine.lastPrefixHitCount
         let fresh = try await multimodal(extended, session: try fixture.engine.makeSessionState(), fixture: fixture)
 
-        print("VLM_PARITY same-image-extension prefixHit=\(start)/\(extended.count) \(compare(reused, fresh))")
-        #expect(reused.tokens == fresh.tokens)
-        #expect(reused.logits == fresh.logits)
+        print("VLM_PARITY same-image-extension prefixHit=\(hit)/\(extended.count) \(compare(reused, fresh))")
+        #expect(hit == start)
     }
 
     @Test("a different image at the same positions is never served from the cached prefix")
@@ -238,18 +248,18 @@ struct VLMSessionParityTests {
         let other = try await fixture.engine.encodeImage(cgImage: try solidImage(red: 0.9, green: 0.1, blue: 0.1))
         try #require(other.tokenCount == fixture.image.tokenCount)
 
-        // Identical tokens (same placeholder count), different image.
+        // Identical tokens (same placeholder count): the original image, then a different one.
         let extended = turn1 + answer1.tokens + followUp
-        let swapped = try await multimodal(extended, image: other, session: session, fixture: fixture)
-        let swapHit = fixture.engine.lastPrefixHitCount
         let start = try imageStart(of: extended, fixture)
-        #expect(swapHit <= start)
-        let fresh = try await multimodal(
-            extended, image: other, session: try fixture.engine.makeSessionState(), fixture: fixture)
+        let original = try await multimodal(extended, session: session, resumesAt: start, fixture: fixture)
+        let swapped = try await multimodal(extended, image: other, session: session, resumesAt: start, fixture: fixture)
+        let swapHit = fixture.engine.lastPrefixHitCount
 
+        print("VLM_PARITY swapped-image prefixHit=\(swapHit)/\(extended.count)")
+        print("VLM_PARITY original-image: \(decode(original.tokens, fixture))")
         print("VLM_PARITY swapped-image: \(decode(swapped.tokens, fixture))")
-        #expect(swapped.tokens == fresh.tokens)
-        #expect(swapped.logits == fresh.logits)
+        #expect(swapHit == start)
+        #expect(swapped.tokens != original.tokens)
     }
 
     @Test("an image after the cached text reuses the text and prefills the image on the session")
@@ -272,21 +282,20 @@ struct VLMSessionParityTests {
             + [Int32](repeating: fixture.imageTokenId, count: fixture.image.tokenCount) + question
         let start = try imageStart(of: extended, fixture)
 
-        let reused = try await multimodal(extended, session: session, fixture: fixture)
+        // The text turn's last sampled token is not in the KV cache yet.
+        let cached = textPrompt.count + answer.tokens.count - 1
+        let reused = try await multimodal(extended, session: session, resumesAt: cached, fixture: fixture)
         let hit = fixture.engine.lastPrefixHitCount
         let fresh = try await multimodal(extended, session: try fixture.engine.makeSessionState(), fixture: fixture)
 
-        // Measured, not asserted equal: the reused text KV was built token by token during decode.
         print(
             "VLM_PARITY image-after-text prefixHit=\(hit)/\(extended.count) imageStart=\(start) "
                 + "\(compare(reused, fresh))")
         print("VLM_PARITY image-after-text: \(decode(reused.tokens, fixture))")
-        #expect(hit == textPrompt.count + answer.tokens.count - 1)
-        #expect(hit <= start)
-        #expect(!reused.tokens.isEmpty)
+        #expect(hit == cached)
     }
 
-    @Test("text-only: re-requesting a prefix on the VLM decoder rewinds and reproduces the run")
+    @Test("a text-only re-request reseeds one token back, and rewinds to the template after an image turn")
     func textOnlyRewindRoundTrip() async throws {
         let fixture = try await makeFixture()
         let prompt = try fixture.tokenizer.applyChatTemplate(
@@ -296,18 +305,122 @@ struct VLMSessionParityTests {
         let session = try fixture.engine.makeSessionState()
         let first = try await textOnly(prompt, session: session, fixture: fixture)
 
-        // Identical re-request: the session rewinds one token to reseed instead of full-resetting.
-        let again = try await textOnly(prompt, session: session, fixture: fixture)
+        let again = try await textOnly(prompt, session: session, resumesAt: prompt.count - 1, fixture: fixture)
         #expect(fixture.engine.lastPrefixHitCount == prompt.count)
         print("VLM_PARITY text-rewind \(compare(again, first))")
-        #expect(again.tokens == first.tokens)
 
-        // A text-only request after an image turn does not reuse the image KV.
+        // A different text-only request after an image turn rewinds to the shared template prefix.
+        let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
+        let shared = sharedPrefix(prompt, turn1)
+        let start = try imageStart(of: turn1, fixture)
+        try #require(shared <= start)
+        _ = try await multimodal(turn1, session: session, fixture: fixture)
+        let afterImage = try await textOnly(prompt, session: session, resumesAt: shared, fixture: fixture)
+        #expect(fixture.engine.lastPrefixHitCount == shared)
+        print("VLM_PARITY text-after-image \(compare(afterImage, first))")
+    }
+
+    @Test("a text-only follow-up after an image turn continues on the cached image")
+    func textFollowUpReusesImage() async throws {
+        let fixture = try await makeFixture()
+        let followUp = fixture.tokenizer.encode(text: VLMParityFixture.followUpText, addSpecialTokens: false)
+            .map(Int32.init)
+        let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
+        let session = try fixture.engine.makeSessionState()
+
+        // Image placeholders that are not in the KV cache need the image.
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await textOnly(turn1, session: session, fixture: fixture)
+        }
+
+        let answer1 = try await multimodal(turn1, session: session, fixture: fixture)
+        let extended = turn1 + answer1.tokens + followUp
+        let cached = turn1.count + answer1.tokens.count - 1
+        let reused = try await textOnly(extended, session: session, resumesAt: cached, fixture: fixture)
+        let hit = fixture.engine.lastPrefixHitCount
+        let fresh = try await multimodal(extended, session: try fixture.engine.makeSessionState(), fixture: fixture)
+
+        print("VLM_PARITY text-follow-up prefixHit=\(hit)/\(extended.count) \(compare(reused, fresh))")
+        print("VLM_PARITY text-follow-up: \(decode(reused.tokens, fixture))")
+        #expect(hit == cached)
+    }
+
+    @Test("a templated text-only second turn rewinds past the cached image")
+    func templatedTextTurnReusesImage() async throws {
+        let fixture = try await makeFixture()
+        let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
+        let session = try fixture.engine.makeSessionState()
+        let answer1 = try await multimodal(turn1, session: session, fixture: fixture)
+
+        // The template re-encodes the assistant turn, so the match ends somewhere past the image.
+        let turn2 = try promptTokens(
+            [
+                ["role": "user", "content": VLMParityFixture.question1],
+                ["role": "assistant", "content": fixture.tokenizer.decode(tokens: answer1.tokens.map(Int.init))],
+                ["role": "user", "content": VLMParityFixture.question2],
+            ], fixture: fixture)
+        let shared = sharedPrefix(turn2, turn1 + answer1.tokens.dropLast())
+        let imageEnd = try imageStart(of: turn1, fixture) + fixture.image.tokenCount
+        try #require(shared >= imageEnd)
+
+        let reply = try await textOnly(turn2, session: session, resumesAt: shared, fixture: fixture)
+        print("VLM_PARITY templated-text-turn2 prefixHit=\(fixture.engine.lastPrefixHitCount)/\(turn2.count)")
+        print("VLM_PARITY templated-text-turn2: \(decode(reply.tokens, fixture))")
+        #expect(fixture.engine.lastPrefixHitCount == shared)
+    }
+
+    @Test("a rejected text-only request leaves the session's generation and hit count alone")
+    func rejectedRequestHasNoSideEffects() async throws {
+        let fixture = try await makeFixture()
+        let followUp = fixture.tokenizer.encode(text: VLMParityFixture.followUpText, addSpecialTokens: false)
+            .map(Int32.init)
         let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
         let start = try imageStart(of: turn1, fixture)
-        _ = try await multimodal(turn1, session: session, fixture: fixture)
-        let afterImage = try await textOnly(prompt, session: session, fixture: fixture)
-        #expect(fixture.engine.lastPrefixHitCount <= start)
-        #expect(afterImage.tokens == first.tokens)
+        let session = try fixture.engine.makeSessionState()
+        let answer1 = try await multimodal(turn1, session: session, fixture: fixture)
+
+        let sequence = try await fixture.engine.generate(
+            with: fixture.image, tokens: turn1 + answer1.tokens + followUp, sessionState: session,
+            samplingConfiguration: .greedy, inferenceOptions: options)
+        let iterator = sequence.makeAsyncIterator()
+        _ = try await iterator.next()
+        let processed = session.processedTokenCount
+
+        // Diverges at position 0, so none of its placeholders are cached.
+        await #expect(throws: InferenceRuntimeError.self) {
+            _ = try await fixture.engine.generate(
+                with: followUp + turn1, sessionState: session, samplingConfiguration: .greedy,
+                inferenceOptions: options)
+        }
+        #expect(session.lastPrefixHitCount == start)
+        #expect(fixture.engine.lastPrefixHitCount == start)
+        #expect(session.processedTokenCount == processed)
+
+        while try await iterator.next() != nil {}
+        #expect(sequence.stopReason != .cancelled)
+    }
+
+    @Test("forced-continuation scoring after an image turn runs only the uncached tokens")
+    func forcedContinuationAfterImage() async throws {
+        let fixture = try await makeFixture()
+        let turn1 = try promptTokens([["role": "user", "content": VLMParityFixture.question1]], fixture: fixture)
+        let session = try fixture.engine.makeSessionState()
+        let answer1 = try await multimodal(turn1, session: session, fixture: fixture)
+
+        // `turn1` is a strict prefix of the history: reseed its last token, then score the answer.
+        let scored = try await textOnly(
+            turn1, session: session, resumesAt: turn1.count - 1,
+            inferenceOptions: .eval(maxTokens: answer1.tokens.count, forcedContinuation: answer1.tokens),
+            fixture: fixture)
+        // As in decode, the last forced token is not run.
+        #expect(session.processedTokenCount == turn1.count + answer1.tokens.count - 1)
+        #expect(session.history.count == session.processedTokenCount)
+
+        let agree = zip(scored.logits, answer1.tokens).filter { logits, token in
+            logits.indices.max { logits[$0] < logits[$1] } == Int(token)
+        }.count
+        print("VLM_PARITY forced-continuation argmax agrees \(agree)/\(answer1.tokens.count)")
+        #expect(scored.logits.count == answer1.tokens.count)
+        #expect(agree * 2 >= answer1.tokens.count)
     }
 }
