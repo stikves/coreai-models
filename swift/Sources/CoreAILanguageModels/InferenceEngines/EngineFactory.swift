@@ -102,6 +102,7 @@ public struct EngineFactory: Sendable {
                 throw InferenceRuntimeError.invalidArgument(
                     "VLM bundle missing 'vision' config in metadata.json")
             }
+            try validateVLMVariant(options.variant, tokenMerge: visionConfig.tokenMerge)
             switch visionConfig.tokenMerge {
             case .decoderGather:
                 return try await makeStaticShapeVLMEngine(
@@ -182,15 +183,13 @@ public struct EngineFactory: Sendable {
         )
     }
 
-    /// Build `CoreAISequentialEngine` for a separate-embedding VLM: check the variant override,
-    /// assemble the config, prepare the three components, and construct the engine with its vision
+    /// Build `CoreAISequentialEngine` for a separate-embedding VLM: assemble the config, prepare the three components, and construct the engine with its vision
     /// components. Components are prepared one at a time to keep Core AI specialization stable.
     private static func makeVLMEngine(
         bundle: LanguageModelBundle,
         languageModelURL: URL,
         options: EngineOptions
     ) async throws -> any InferenceEngine {
-        try validateVLMVariant(options.variant)
         let vlmConfig = try makeVLMConfig(
             bundle: bundle, languageModelURL: languageModelURL, options: options)
 
@@ -213,10 +212,11 @@ public struct EngineFactory: Sendable {
         )
     }
 
-    /// Checks the variant override for a separate-embedding VLM, which runs only on the sequential
-    /// engine. Auto-detection and `coreai-sequential` pass; any other variant throws
+    /// Checks the variant override for a VLM. Each token-merge mode runs on one engine: a
+    /// separate-embedding VLM on `coreai-sequential`, a decoder-gather VLM on `static-shape`.
+    /// Auto-detection and that engine's variant pass; any other variant throws
     /// `unsupportedEngineVariant`.
-    static func validateVLMVariant(_ override: String?) throws {
+    static func validateVLMVariant(_ override: String?, tokenMerge: VisionTokenMerge) throws {
         guard let override, override != "auto", override != "default" else {
             return
         }
@@ -224,10 +224,11 @@ public struct EngineFactory: Sendable {
             throw InferenceRuntimeError.unsupportedEngineVariant(
                 "Unknown variant '\(override)'. Valid: auto, coreai-sequential, coreai-pipelined, static-shape")
         }
-        guard variant == .sequential else {
+        let supported: Variant = tokenMerge == .separateEmbedding ? .sequential : .staticShape
+        guard variant == supported else {
             throw InferenceRuntimeError.unsupportedEngineVariant(
-                "Variant '\(override)' does not run separate-embedding vision-language models; "
-                    + "use coreai-sequential")
+                "Variant '\(override)' does not run \(tokenMerge.rawValue) vision-language models; "
+                    + "use \(supported.rawValue)")
         }
     }
 

@@ -1465,6 +1465,7 @@ extension CoreAISequentialEngine.GenerationSequence {
 
             // Row `r` of `allLogits` predicts the token after position `cached + r`; keep the rows
             // that predict each forced token.
+            // TODO: Unit-test the row offset with `cached > 0`; in-tree callers always reset first.
             let firstRow = inputTokens.count - 1 - cached
             var buffer: [[LogitsScalarType]] = []
             for i in 0..<forced.count {
