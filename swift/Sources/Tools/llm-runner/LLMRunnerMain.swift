@@ -286,6 +286,13 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
     )
     var clearCoreAICache: Bool = false
 
+    @Flag(
+        name: .customLong("skip-memory-check"),
+        help:
+            "Load the model even when its estimated memory need (weights plus KV cache) exceeds the memory available"
+    )
+    var skipMemoryCheck: Bool = false
+
     @Flag(help: "Enable verbose logging")
     var verbose: Bool = false
 
@@ -439,7 +446,44 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         // Test signpost right at the start
         InstrumentsProfiler.logMemoryUsage(phase: "AppStart")
 
-        try await runModel(path: resolvedPath, resolver: resolver)
+        do {
+            try await runModel(path: resolvedPath, resolver: resolver)
+        } catch {
+            // A failed GPU command buffer (usually out of memory) means the output is garbage:
+            // say so in one line and exit non-zero, never "Generation complete!".
+            guard let gpuError = GPUCommandBufferError.find(in: error) else { throw error }
+            print("\nError: \(gpuError.description)")
+            throw ExitCode.failure
+        }
+    }
+
+    /// Refuse to load a model whose estimated memory need exceeds what the device has.
+    ///
+    /// The estimate is a lower bound (see `MemoryEstimate`), so this only stops a model that
+    /// can't fit; one that might fit still loads. `--skip-memory-check` turns it off.
+    func checkMemory(bundle: LanguageModelBundle) throws {
+        let contextTokens = MemoryPreflight.kvContextTokens(
+            strategy: kvCacheStrategy, initialCapacity: kvCacheInitialCapacity,
+            maxTokens: maxTokens, maxContextLength: bundle.maxContextLength)
+        let estimate = MemoryPreflight.estimate(bundle: bundle, contextTokens: contextTokens)
+        let budget = MemoryPreflight.availableMemory()
+        CLILogger.log(
+            "Memory check: needs ~\(MemoryPreflight.formatGB(estimate.totalBytes)) "
+                + "(weights \(MemoryPreflight.formatGB(estimate.weightBytes)), "
+                + "state \(estimate.stateBytes.map(MemoryPreflight.formatGB) ?? "unknown") "
+                + "at \(contextTokens) tokens); device \(budget.deviceBytes.map(MemoryPreflight.formatGB) ?? "unknown"), "
+                + "process limit leaves \(budget.processBytes.map(MemoryPreflight.formatGB) ?? "no limit")",
+            component: "Main")
+        if case .tooLarge(let limit, let needed, let availableBytes) = MemoryPreflight.verdict(
+            for: estimate, budget: budget)
+        {
+            print(
+                "Error: "
+                    + MemoryPreflight.tooLargeMessage(
+                        modelName: bundle.name, estimate: estimate, limit: limit, neededBytes: needed,
+                        availableBytes: availableBytes))
+            throw ExitCode.failure
+        }
     }
 
     func validateAndResolveModelPath(resolver: ModelPaths) throws -> String {
@@ -857,6 +901,9 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         let bundle = try LanguageModelBundle(from: modelFile)
         try bundle.modelBundle.validateModelAssets()
+        if !skipMemoryCheck {
+            try checkMemory(bundle: bundle)
+        }
         let modelName = bundle.name
         let modelVocabSize = bundle.vocabSize
         if let rawScoring {
@@ -1317,15 +1364,21 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             tokens: actualInputTokens, engine: "CoreAI-Constrained")
         var extendSpan: ProfileSpan?
 
-        for try await result in constrainedStream {
-            if promptSpan != nil {
-                promptSpan?.end()
-                promptSpan = nil
-                extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+        do {
+            for try await result in constrainedStream {
+                if promptSpan != nil {
+                    promptSpan?.end()
+                    promptSpan = nil
+                    extendSpan = InstrumentsProfiler.beginExtend(step: 0, tokens: 1)
+                }
+                generatedText += result.text
+                generatedTokenCount += 1
+                print(result.text, terminator: "")
             }
-            generatedText += result.text
-            generatedTokenCount += 1
-            print(result.text, terminator: "")
+        } catch {
+            promptSpan?.end()
+            extendSpan?.end()
+            throw error
         }
         promptSpan?.end()
         extendSpan?.end()
@@ -1796,7 +1849,12 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
         }
 
         let span = InstrumentsProfiler.beginWarmup()
-        try await engine.warmup(queryLength: queryLength, sampling: samplingConfiguration)
+        do {
+            try await engine.warmup(queryLength: queryLength, sampling: samplingConfiguration)
+        } catch {
+            span.end()
+            throw error
+        }
         span.end()
 
         if let warmupStats = await StatsStorage.shared.stats(for: .warmup) {

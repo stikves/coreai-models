@@ -20,3 +20,13 @@ struct LLMRunnerArgumentTests {
         #expect(runner.rawContinuation == "continuation.json")
     }
 }
+
+/// Covers the memory pre-flight opt-out.
+@Suite("LLMRunner memory check flag")
+struct LLMRunnerMemoryCheckFlagTests {
+    @Test("the memory check runs unless --skip-memory-check is given")
+    func parsesSkipMemoryCheck() throws {
+        #expect(try LLMRunner.parse([]).skipMemoryCheck == false)
+        #expect(try LLMRunner.parse(["--skip-memory-check"]).skipMemoryCheck == true)
+    }
+}

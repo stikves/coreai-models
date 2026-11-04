@@ -260,6 +260,11 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
                 stopReasonStore.set(.cancelled)
                 outputContinuation.finish()
             } catch {
+                if error is GPUCommandBufferError {
+                    // The failed step's KV writes may be garbage: replay from scratch next time.
+                    self.engine.reset()
+                    self.history.clear()
+                }
                 stopReasonStore.set(.error)
                 outputContinuation.finish(throwing: error)
             }
@@ -567,6 +572,31 @@ final class PipelineGate: Sendable {
     }
 }
 
+// MARK: - Token Delivery
+
+/// Hand a token the GPU sampler produced to the stream, unless something failed.
+///
+/// Runs on Metal's callback thread, once per step. A step whose command buffer failed, or any
+/// later step (it reads the failed step's KV writes and sampled token), samples garbage logits,
+/// so the stream ends with the first failure instead of yielding the token. A sampler error is
+/// recorded as that failure. `internal` so `PipelinedFailureTests` can reach it.
+func deliverSampledToken(
+    _ token: InferenceEngine.TokenId,
+    error: (any Error)?,
+    failures: GPUFailureLatch,
+    to continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
+) {
+    if let error {
+        continuation.finish(throwing: failures.record(GPUCommandBufferError.wrapping(error)))
+        return
+    }
+    if let failure = failures.failure {
+        continuation.finish(throwing: failure)
+        return
+    }
+    continuation.yield(token)
+}
+
 // MARK: - Engine Implementation
 
 private struct EngineImpl: ~Copyable {
@@ -577,9 +607,14 @@ private struct EngineImpl: ~Copyable {
     let config: ModelConfig
     let options: EngineOptions
     let function: InferenceFunction
-    let pipelineQueue: MTLCommandQueue
+    /// The engine's queue, wrapped so every command buffer made from it is checked (see
+    /// `MonitoredCommandQueue`). Core AI's encode, the MPSGraph samplers and the KV cache
+    /// growth commit on it too.
+    let pipelineQueue: MonitoredCommandQueue
     let computeStream: ComputeStream
     let device: MTLDevice
+    /// First GPU failure of the current run; checked before every yield and every encode.
+    let gpuFailures: GPUFailureLatch
 
     // Prefill chunks run here when the asset has this graph. It produces no logits, so
     // the last prompt token still goes through `function` to seed sampling.
@@ -846,11 +881,15 @@ private struct EngineImpl: ~Copyable {
                 "Cannot load function '\(config.function)'")
         }
 
-        guard let pipelineQueue = device.makeCommandQueue() else {
+        guard let metalQueue = device.makeCommandQueue() else {
             throw InferenceRuntimeError.invalidState(
                 "Failed to allocate MTLCommandQueue for CoreAIPipelinedEngine")
         }
-        pipelineQueue.label = "CoreAIPipelinedEngine.queue"
+        metalQueue.label = "CoreAIPipelinedEngine.queue"
+        let gpuFailures = GPUFailureLatch()
+        let pipelineQueue = MonitoredCommandQueue(wrapping: metalQueue) { failure in
+            gpuFailures.record(failure)
+        }
         let computeStream = ComputeStream(commandQueue: pipelineQueue)
 
         // Assign
@@ -862,6 +901,7 @@ private struct EngineImpl: ~Copyable {
         self.pipelineQueue = pipelineQueue
         self.computeStream = computeStream
         self.device = device
+        self.gpuFailures = gpuFailures
         self.inputIdsName = inputIdsName
         self.positionIdsName = positionIdsName
         self.keyCacheName = keyCacheName
@@ -953,6 +993,9 @@ private struct EngineImpl: ~Copyable {
         gpuSampler: any MPSGraphSampler,
         yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
     ) async throws {
+        // A failed step poisons every later one (they read its KV writes and sampled token).
+        try gpuFailures.throwIfFailed()
+
         let currentStep = processedTokenCount
 
         let actualTokenCount = tokens.isEmpty ? 1 : tokens.count
@@ -1064,6 +1107,14 @@ private struct EngineImpl: ~Copyable {
         // Backpressure: cap outstanding encode calls
         await inFlightGate.acquire()
 
+        // The wait may have ended because a failed step's callback released the slot.
+        if let failure = gpuFailures.failure {
+            inFlightGate.release()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep", signpostID: encodeStepID, details: "gpu-failure")
+            throw failure
+        }
+
         // Encode inference using the public encode() API.
         // This commits + uses runAfterSyncPoint (no stream wait) — enables true pipelining.
         let logitsSpan = InstrumentsProfiler.beginLogitsInference(
@@ -1071,14 +1122,23 @@ private struct EngineImpl: ~Copyable {
 
         // Swift 6 lifetime safety: AsyncMutableViews uses @lifetime(self: &mutableValue)
         // on insert(), so all inserts + consume must be in the same scope without branching.
-        try encodeWithStates(
-            function: function, inputs: asyncInputs,
-            keyState: &keyState, keyCacheName: keyCacheName,
-            valState: &valState, valueCacheName: valueCacheName,
-            additionalStates: additionalStates,
-            logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
-            logitsShape: logitsShape, logitsStrides: logitsStrides,
-            computeStream: computeStream)
+        do {
+            try encodeWithStates(
+                function: function, inputs: asyncInputs,
+                keyState: &keyState, keyCacheName: keyCacheName,
+                valState: &valState, valueCacheName: valueCacheName,
+                additionalStates: additionalStates,
+                logitsBuffer: logitsOutputBuffer, logitsName: logitsOutputName,
+                logitsShape: logitsShape, logitsStrides: logitsStrides,
+                computeStream: computeStream)
+        } catch {
+            // No sampler callback will run for this step: give its slot back here.
+            inFlightGate.release()
+            logitsSpan.end()
+            InstrumentsProfiler.endCustomInterval(
+                name: "CoreAIPipelinedEncodeNextStep", signpostID: encodeStepID, details: "error")
+            throw error
+        }
         logitsSpan.end()
 
         // GPU sampling via Metal queue
@@ -1095,6 +1155,7 @@ private struct EngineImpl: ~Copyable {
         let queue = pipelineQueue
         let localInFlightGate = inFlightGate
         let localPenaltyState = penaltyState
+        let localFailures = gpuFailures
         let completionCallback: (Int32, Error?) -> Void = { nextToken, error in
             // Update penalty state BEFORE releasing the gate.
             localPenaltyState?.recordToken(nextToken)
@@ -1106,11 +1167,7 @@ private struct EngineImpl: ~Copyable {
                 signpostID: encodeStepID,
                 details: "token=\(nextToken)"
             )
-            if let error {
-                continuation.finish(throwing: error)
-                return
-            }
-            continuation.yield(nextToken)
+            deliverSampledToken(nextToken, error: error, failures: localFailures, to: continuation)
         }
 
         do {
@@ -1187,21 +1244,13 @@ private struct EngineImpl: ~Copyable {
             step: processedTokenCount, operation: "grow", engine: "CoreAI-Pipelined")
 
         do {
-            do {
-                let queue = pipelineQueue
-                guard let cmdBuf = queue.makeCommandBuffer() else {
-                    throw KVCacheError.allocationFailed(0)
-                }
-
-                if (try kvCache.encodePipelinedExpansion(
-                    forContextLength: neededCapacity,
-                    commandBuffer: cmdBuf)) != nil
-                {
-                    CLILogger.log("KV cache grew (pipelined) to \(kvCache.currentCapacity)")
-                } else {
-                    throw KVCacheError.capacityExceeded(
-                        needed: neededCapacity, available: kvCache.currentCapacity)
-                }
+            // The copy is committed on the monitored queue, so a failed grow is latched, and
+            // the next step's sampler callback (or the final drain) reports it.
+            if try kvCache.ensureCapacity(forContextLength: neededCapacity, queue: pipelineQueue) {
+                CLILogger.log("KV cache grew (pipelined) to \(kvCache.currentCapacity)")
+            } else {
+                throw KVCacheError.capacityExceeded(
+                    needed: neededCapacity, available: kvCache.currentCapacity)
             }
         } catch {
             cacheSpan.end()
@@ -1219,6 +1268,9 @@ private struct EngineImpl: ~Copyable {
         yieldingTo continuation: AsyncThrowingStream<InferenceEngine.TokenId, Error>.Continuation
     ) async throws {
         let gpuSampler = try getOrCreateSampler(for: sampler)
+        // Forget an earlier run's failure. Every run drains the queue before it returns, so no
+        // callback of an earlier run can record into this one.
+        gpuFailures.reset()
 
         let isCancelled = Atomic<Bool>(false)
         continuation.onTermination = { _ in
@@ -1250,59 +1302,99 @@ private struct EngineImpl: ~Copyable {
 
         // Prefill the prompt, then sample from the tokens prefill left behind.
         // Skip it entirely if the prompt is empty (prefix-cached continuation).
-        if !prompt.isEmpty {
-            let prefillTokens = try await prefill(prompt: prompt)
+        do {
+            if !prompt.isEmpty {
+                let prefillTokens = try await prefill(prompt: prompt)
 
-            // Process the remaining prompt tokens with sampling
-            try await _encodeNextStepGPU(
-                tokens: prefillTokens,
-                gpuSampler: gpuSampler,
-                yieldingTo: continuation
-            )
-        }
-
-        // Generate-Grow-Continue loop
-        var remainingTokens = totalMaxTokens - 1
-
-        while remainingTokens > 0 {
-            guard !isCancelled.load(ordering: .relaxed) else { break }
-
-            let availableSlots = kvCache.currentCapacity - processedTokenCount
-            let tokensThisRound = min(remainingTokens, availableSlots)
-
-            if tokensThisRound > 0 {
-                try await generateTokenBatch(
-                    count: tokensThisRound,
+                // Process the remaining prompt tokens with sampling
+                try await _encodeNextStepGPU(
+                    tokens: prefillTokens,
                     gpuSampler: gpuSampler,
-                    yieldingTo: continuation,
-                    isCancelled: isCancelled
+                    yieldingTo: continuation
                 )
-                remainingTokens -= tokensThisRound
             }
 
-            if remainingTokens > 0 {
-                let neededCapacity = processedTokenCount + remainingTokens
-                try await growKVCacheAndRebind(neededCapacity: neededCapacity)
-            }
-        }
+            // Generate-Grow-Continue loop
+            var remainingTokens = totalMaxTokens - 1
 
-        // Sentinel: submit an empty command buffer on the same serial queue.
-        // Its addCompletedHandler fires after all real sampler callbacks (serial
-        // queue FIFO ordering via MTLDispatchListApply), guaranteeing every
-        // continuation.yield has returned before the caller calls finish().
-        // We use a bare command buffer instead of the sampler to avoid the shared
-        // MPSGraphExecutableExecutionDescriptor issue in MPSGraphCompositeSampler.
-        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
-            do {
-                let queue = pipelineQueue
-                guard let cmdBuf = queue.makeCommandBuffer() else {
-                    sentinelCont.resume()
-                    return
+            while remainingTokens > 0 {
+                guard !isCancelled.load(ordering: .relaxed) else { break }
+
+                let availableSlots = kvCache.currentCapacity - processedTokenCount
+                let tokensThisRound = min(remainingTokens, availableSlots)
+
+                if tokensThisRound > 0 {
+                    try await generateTokenBatch(
+                        count: tokensThisRound,
+                        gpuSampler: gpuSampler,
+                        yieldingTo: continuation,
+                        isCancelled: isCancelled
+                    )
+                    remainingTokens -= tokensThisRound
                 }
-                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
-                cmdBuf.commit()
+
+                if remainingTokens > 0 {
+                    let neededCapacity = processedTokenCount + remainingTokens
+                    try await growKVCacheAndRebind(neededCapacity: neededCapacity)
+                }
             }
+        } catch {
+            throw await settleAfterError(error, continuation: continuation)
         }
+
+        // Every sampler callback has run once the queue drains (see `drainPipelineQueue`).
+        await drainPipelineQueue()
+
+        // A failure in the last command buffers (a KV grow, the sentinel) has no sampler
+        // callback after it to end the stream.
+        if let failure = gpuFailures.failure {
+            continuation.finish(throwing: failure)
+            throw failure
+        }
+    }
+
+    /// Wait for every command buffer committed so far on `pipelineQueue` to complete.
+    ///
+    /// Submits an empty command buffer on the same serial queue. Its addCompletedHandler fires
+    /// after all real sampler callbacks (serial queue FIFO ordering via MTLDispatchListApply),
+    /// guaranteeing every continuation.yield has returned, and every command buffer has been
+    /// checked, before the caller calls finish().
+    /// We use a bare command buffer instead of the sampler to avoid the shared
+    /// MPSGraphExecutableExecutionDescriptor issue in MPSGraphCompositeSampler.
+    ///
+    /// The sentinel comes from the real queue and checks itself, so it carries one handler.
+    /// It runs after every earlier command buffer, so its handler is also the last chance to
+    /// see a failure no other buffer reported.
+    private func drainPipelineQueue() async {
+        let failures = gpuFailures
+        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
+            guard let cmdBuf = pipelineQueue.base.makeCommandBuffer() else {
+                sentinelCont.resume()
+                return
+            }
+            cmdBuf.label = "CoreAIPipelinedEngine.drain"
+            cmdBuf.addCompletedHandler { completed in
+                failures.recordFailure(of: completed)
+                sentinelCont.resume()
+            }
+            cmdBuf.commit()
+        }
+    }
+
+    /// The error to throw when a run stops with `error`.
+    ///
+    /// The queue is drained first, so no callback of this run lands after the engine is
+    /// handed back and every pipeline slot has been given back. If a GPU command buffer
+    /// failed, that failure is the cause (the error may only be its consequence), so it wins
+    /// and the token stream ends with it. Any other error is returned unchanged.
+    private func settleAfterError<Element>(
+        _ error: any Error,
+        continuation: AsyncThrowingStream<Element, Error>.Continuation
+    ) async -> any Error {
+        await drainPipelineQueue()
+        guard let failure = gpuFailures.failure else { return error }
+        continuation.finish(throwing: failure)
+        return failure
     }
 
     // MARK: - Constrained Run Completion
@@ -1320,174 +1412,183 @@ private struct EngineImpl: ~Copyable {
         yieldingTo continuation: AsyncThrowingStream<Int32, Error>.Continuation
     ) async throws {
         let gpuSampler = try getOrCreateSampler(for: sampler)
+        gpuFailures.reset()
+        let failures = gpuFailures
 
         guard let bitmaskBuffer = try gpuSampler.bitmaskBuffer else {
             throw InferenceRuntimeError.invalidArgument(
                 "Constrained generation requires a sampler that supports bitmask application")
         }
 
-        // Pre-grow KV cache
-        let totalNeeded = prompt.count + maxTokens
-        try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
+        do {
+            // Pre-grow KV cache
+            let totalNeeded = prompt.count + maxTokens
+            try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
 
-        // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
-        let prefillTokens: [Int32]
-        if slidingRingCapacity != nil {
-            // Ring models take the plain prefill path, which never runs a multi-token
-            // write-first step past the ring.
-            prefillTokens = Array(try await prefill(prompt: prompt))
-        } else if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
-            prompt.count > threshold
-        {
-            let remaining = try await processChunkedInput(tokens: prompt)
-            prefillTokens = Array(remaining)
-        } else {
-            prefillTokens = prompt
-        }
-
-        try logits.ensureCapacity(forContextLength: max(1, prefillTokens.count))
-
-        // Fill initial bitmask — the first generated token must also be constrained
-        // (e.g. JSON schema requires '{' as first character, not '<think>')
-        let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-        let initialMask = session.fillBitmask(into: bitmaskPtr)
-        if case .terminated = initialMask {
-            return  // Grammar already terminated — nothing to generate
-        }
-        let applyInitialMask = initialMask == .constrained
-
-        // Encode prefill and sample first token
-        var lastToken: Int32 = try await withCheckedThrowingContinuation { cont in
-            do {
-                try _encodeStepForConstrainedGeneration(
-                    tokens: prefillTokens,
-                    gpuSampler: gpuSampler,
-                    applyBitmask: applyInitialMask
-                ) { token, error in
-                    if let error = error {
-                        cont.resume(throwing: error)
-                    } else {
-                        cont.resume(returning: token)
-                    }
-                }
-            } catch {
-                cont.resume(throwing: error)
-            }
-        }
-
-        // NOTE: `lastToken` is deliberately NOT yielded here. A sampled token is
-        // only emitted after the grammar has accepted it (at the top of the loop)
-        // and we've confirmed the acceptance did not terminate the grammar.
-        // Otherwise the grammar's terminal token (e.g. <|endoftext|>, 151643) would
-        // be streamed to the consumer before termination is detected and would leak
-        // into the structured output. This mirrors the CPU ConstrainedDecodingStrategy
-        // fix in #117, which returns nil instead of emitting the terminal token's text.
-
-        // Constrained decode loop
-        var generated = 0
-        while generated < maxTokens {
-            guard !isCancelled.load(ordering: .relaxed) else { break }
-            try Task.checkCancellation()
-
-            // Accept the most recently sampled token in the grammar.
-            if !session.acceptToken(lastToken) { break }
-            // If accepting it terminated the grammar, `lastToken` is the terminal
-            // (stop) token — break WITHOUT emitting it.
-            if session.isTerminated { break }
-
-            // `lastToken` is confirmed to be valid structured content — emit it now.
-            continuation.yield(lastToken)
-            generated += 1
-            if generated >= maxTokens { break }
-
-            // Check for jump-forward: deterministic grammar segments that can be
-            // batch-encoded without per-token sampling (saves N-1 round-trips)
-            if let jumpString = session.findJumpForwardString(),
-                let jumpTokens = tokenizeJumpForward(jumpString, session: session)
+            // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
+            let prefillTokens: [Int32]
+            if slidingRingCapacity != nil {
+                // Ring models take the plain prefill path, which never runs a multi-token
+                // write-first step past the ring.
+                prefillTokens = Array(try await prefill(prompt: prompt))
+            } else if case .chunk(let threshold, _) = inputLayout.prefillPolicy,
+                prompt.count > threshold
             {
-                // Batch-encode jump-forward tokens + sample next token after them
-                let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-                let postJumpMask = session.fillBitmask(into: bitmaskPtr)
-                if case .terminated = postJumpMask { break }
-                let applyMaskAfterJump = postJumpMask == .constrained
-
-                // Only the last token's logits are sampled, so a step that would evict ring
-                // history can prefill the rest first.
-                var jumpStep = [lastToken] + jumpTokens
-                if let ring = slidingRingCapacity,
-                    StateHandlerFactory.writeFirstStepEvicts(
-                        offset: processedTokenCount, queryLength: jumpStep.count, ringCapacity: ring)
-                {
-                    jumpStep = Array(try await prefill(prompt: jumpStep))
-                }
-
-                lastToken = try await withCheckedThrowingContinuation { cont in
-                    do {
-                        try _encodeStepForConstrainedGeneration(
-                            tokens: jumpStep,
-                            gpuSampler: gpuSampler,
-                            applyBitmask: applyMaskAfterJump
-                        ) { token, error in
-                            if let error = error {
-                                cont.resume(throwing: error)
-                            } else {
-                                cont.resume(returning: token)
-                            }
-                        }
-                    } catch {
-                        cont.resume(throwing: error)
-                    }
-                }
-
-                // Emit the deterministic jump-forward tokens now. The freshly sampled
-                // `lastToken` is deferred to the next iteration's accept/termination
-                // check so a terminal token never leaks into the output.
-                for jt in jumpTokens {
-                    continuation.yield(jt)
-                }
-                generated += jumpTokens.count
-                continue
+                let remaining = try await processChunkedInput(tokens: prompt)
+                prefillTokens = Array(remaining)
+            } else {
+                prefillTokens = prompt
             }
 
-            // Fill bitmask — may signal unconstrained (all tokens allowed) or terminated
-            let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
-            let bitmaskResult = session.fillBitmask(into: bitmaskPtr)
-            if case .terminated = bitmaskResult { break }
-            let applyMask = bitmaskResult == .constrained
+            try logits.ensureCapacity(forContextLength: max(1, prefillTokens.count))
 
-            // Encode inference + sampling
-            lastToken = try await withCheckedThrowingContinuation { cont in
+            // Fill initial bitmask — the first generated token must also be constrained
+            // (e.g. JSON schema requires '{' as first character, not '<think>')
+            let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+            let initialMask = session.fillBitmask(into: bitmaskPtr)
+            if case .terminated = initialMask {
+                // Grammar already terminated — nothing to generate. The prompt's GPU work may
+                // still be in flight: wait for it, and report it if it failed.
+                await drainPipelineQueue()
+                try gpuFailures.throwIfFailed()
+                return
+            }
+            let applyInitialMask = initialMask == .constrained
+
+            // Encode prefill and sample first token
+            var lastToken: Int32 = try await withCheckedThrowingContinuation { cont in
                 do {
                     try _encodeStepForConstrainedGeneration(
-                        tokens: [],
+                        tokens: prefillTokens,
                         gpuSampler: gpuSampler,
-                        applyBitmask: applyMask
+                        applyBitmask: applyInitialMask
                     ) { token, error in
-                        if let error = error {
-                            cont.resume(throwing: error)
-                        } else {
-                            cont.resume(returning: token)
-                        }
+                        Self.resume(cont, with: token, error: error, failures: failures)
                     }
                 } catch {
                     cont.resume(throwing: error)
                 }
             }
 
-            // `lastToken` is deferred to the next iteration's accept/termination check.
+            // NOTE: `lastToken` is deliberately NOT yielded here. A sampled token is
+            // only emitted after the grammar has accepted it (at the top of the loop)
+            // and we've confirmed the acceptance did not terminate the grammar.
+            // Otherwise the grammar's terminal token (e.g. <|endoftext|>, 151643) would
+            // be streamed to the consumer before termination is detected and would leak
+            // into the structured output. This mirrors the CPU ConstrainedDecodingStrategy
+            // fix in #117, which returns nil instead of emitting the terminal token's text.
+
+            // Constrained decode loop
+            var generated = 0
+            while generated < maxTokens {
+                guard !isCancelled.load(ordering: .relaxed) else { break }
+                try Task.checkCancellation()
+
+                // Accept the most recently sampled token in the grammar.
+                if !session.acceptToken(lastToken) { break }
+                // If accepting it terminated the grammar, `lastToken` is the terminal
+                // (stop) token — break WITHOUT emitting it.
+                if session.isTerminated { break }
+
+                // `lastToken` is confirmed to be valid structured content — emit it now.
+                continuation.yield(lastToken)
+                generated += 1
+                if generated >= maxTokens { break }
+
+                // Check for jump-forward: deterministic grammar segments that can be
+                // batch-encoded without per-token sampling (saves N-1 round-trips)
+                if let jumpString = session.findJumpForwardString(),
+                    let jumpTokens = tokenizeJumpForward(jumpString, session: session)
+                {
+                    // Batch-encode jump-forward tokens + sample next token after them
+                    let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+                    let postJumpMask = session.fillBitmask(into: bitmaskPtr)
+                    if case .terminated = postJumpMask { break }
+                    let applyMaskAfterJump = postJumpMask == .constrained
+
+                    // Only the last token's logits are sampled, so a step that would evict ring
+                    // history can prefill the rest first.
+                    var jumpStep = [lastToken] + jumpTokens
+                    if let ring = slidingRingCapacity,
+                        StateHandlerFactory.writeFirstStepEvicts(
+                            offset: processedTokenCount, queryLength: jumpStep.count, ringCapacity: ring)
+                    {
+                        jumpStep = Array(try await prefill(prompt: jumpStep))
+                    }
+
+                    lastToken = try await withCheckedThrowingContinuation { cont in
+                        do {
+                            try _encodeStepForConstrainedGeneration(
+                                tokens: jumpStep,
+                                gpuSampler: gpuSampler,
+                                applyBitmask: applyMaskAfterJump
+                            ) { token, error in
+                                Self.resume(cont, with: token, error: error, failures: failures)
+                            }
+                        } catch {
+                            cont.resume(throwing: error)
+                        }
+                    }
+
+                    // Emit the deterministic jump-forward tokens now. The freshly sampled
+                    // `lastToken` is deferred to the next iteration's accept/termination
+                    // check so a terminal token never leaks into the output.
+                    for jt in jumpTokens {
+                        continuation.yield(jt)
+                    }
+                    generated += jumpTokens.count
+                    continue
+                }
+
+                // Fill bitmask — may signal unconstrained (all tokens allowed) or terminated
+                let bitmaskPtr = bitmaskBuffer.contents().assumingMemoryBound(to: Int32.self)
+                let bitmaskResult = session.fillBitmask(into: bitmaskPtr)
+                if case .terminated = bitmaskResult { break }
+                let applyMask = bitmaskResult == .constrained
+
+                // Encode inference + sampling
+                lastToken = try await withCheckedThrowingContinuation { cont in
+                    do {
+                        try _encodeStepForConstrainedGeneration(
+                            tokens: [],
+                            gpuSampler: gpuSampler,
+                            applyBitmask: applyMask
+                        ) { token, error in
+                            Self.resume(cont, with: token, error: error, failures: failures)
+                        }
+                    } catch {
+                        cont.resume(throwing: error)
+                    }
+                }
+
+                // `lastToken` is deferred to the next iteration's accept/termination check.
+            }
+        } catch {
+            throw await settleAfterError(error, continuation: continuation)
         }
 
         // Drain: sentinel command buffer to ensure all GPU work completes
-        await withCheckedContinuation { (sentinelCont: CheckedContinuation<Void, Never>) in
-            do {
-                let queue = pipelineQueue
-                guard let cmdBuf = queue.makeCommandBuffer() else {
-                    sentinelCont.resume()
-                    return
-                }
-                cmdBuf.addCompletedHandler { _ in sentinelCont.resume() }
-                cmdBuf.commit()
-            }
+        await drainPipelineQueue()
+        if let failure = gpuFailures.failure {
+            continuation.finish(throwing: failure)
+            throw failure
+        }
+    }
+
+    /// Resume a constrained step's continuation with its sampled token, unless a command buffer
+    /// failed: a failed step's logits are garbage, so its token must not reach the grammar.
+    private static func resume(
+        _ cont: CheckedContinuation<Int32, any Error>,
+        with token: Int32,
+        error: (any Error)?,
+        failures: GPUFailureLatch
+    ) {
+        if let error {
+            cont.resume(throwing: failures.record(GPUCommandBufferError.wrapping(error)))
+        } else if let failure = failures.failure {
+            cont.resume(throwing: failure)
+        } else {
+            cont.resume(returning: token)
         }
     }
 
@@ -1850,6 +1951,7 @@ private struct EngineImpl: ~Copyable {
     mutating func performWarmup(queryLength: Int, samplingConfig: SamplingConfiguration?) async throws {
         let warmupStart = ContinuousClock.now
         let warmupSpan = InstrumentsProfiler.beginWarmup()
+        gpuFailures.reset()
 
         // A single warmup at any shape primes the framework's internal caches
         // (reshape, kernel compilation, state pool). Benchmarks show no benefit
@@ -1879,107 +1981,120 @@ private struct EngineImpl: ~Copyable {
         // `function` only produces prompt-wide logits when there's no prefill graph.
         try logits.ensureCapacity(forContextLength: prefillFunction != nil ? 1 : maxShape)
 
+        // The sampler callback runs on Metal's callback thread, after this loop has moved on:
+        // it records its error in the latch, which is checked once the queue drains.
+        let failures = gpuFailures
         do {
-            let queue = pipelineQueue
-            if try kvCache.ensureCapacity(forContextLength: maxShape, queue: queue) {
+            if try kvCache.ensureCapacity(forContextLength: maxShape, queue: pipelineQueue) {
                 CLILogger.log("KV cache grew to \(kvCache.currentCapacity) for warmup")
             }
-        }
 
-        let warmupSampler = try MPSGraphSamplerFactory.makeSampler(
-            device: device,
-            vocabSize: config.vocabSize,
-            temperature: samplingConfig?.temperature ?? 0
-        )
+            let warmupSampler = try MPSGraphSamplerFactory.makeSampler(
+                device: device,
+                vocabSize: config.vocabSize,
+                temperature: samplingConfig?.temperature ?? 0
+            )
 
-        for shape in shapesToWarm {
-            // Write dummy tokens
-            let ptr = inputTokensBuffer.contents().bindMemory(to: Int32.self, capacity: shape)
-            for i in 0..<shape { ptr[i] = 1 }
+            for shape in shapesToWarm {
+                // Something already failed (a sampler can report synchronously): stop encoding.
+                if failures.hasFailed { break }
 
-            let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
-            let posLength = processedTokenCount + shape
+                // Write dummy tokens
+                let ptr = inputTokensBuffer.contents().bindMemory(to: Int32.self, capacity: shape)
+                for i in 0..<shape { ptr[i] = 1 }
 
-            let tShape = [1, shape]
-            let tStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tShape)
-            let pShape = [1, posLength]
-            let pStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: pShape)
+                let cachePosBuffer = cachePositionBuffers[step % pipelineDepth]
+                let posLength = processedTokenCount + shape
 
-            let tokenValue = unsafe InferenceFunction.AsyncValue(
-                unsafeBuffer: inputTokensBuffer, byteOffset: 0,
-                scalarType: .int32, shape: tShape, strides: tStrides)
-            let posValue = unsafe InferenceFunction.AsyncValue(
-                unsafeBuffer: cachePosBuffer, byteOffset: 0,
-                scalarType: .int32, shape: pShape, strides: pStrides)
-            let asyncInputs: [String: InferenceFunction.AsyncValue] = [
-                inputIdsName: tokenValue, positionIdsName: posValue,
-            ]
+                let tShape = [1, shape]
+                let tStrides = try resolvedStrides(descriptor: inputIdsBaseDesc, shape: tShape)
+                let pShape = [1, posLength]
+                let pStrides = try resolvedStrides(descriptor: positionIdsBaseDesc, shape: pShape)
 
-            let keyBuffer = kvCache.keyBinding.metalBuffer
-            let kShape = kvCache.keyBinding.layout.shape
-            let kStrides = kvCache.keyBinding.layout.strides
-            let valBuffer = kvCache.valueBinding.metalBuffer
-            let vShape = kvCache.valueBinding.layout.shape
-            let vStrides = kvCache.valueBinding.layout.strides
-            var keyState = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: keyBuffer, byteOffset: 0,
-                scalarType: keyCacheScalarType, shape: kShape, strides: kStrides)
-            var valState = unsafe InferenceFunction.AsyncMutableValue(
-                unsafeBuffer: valBuffer, byteOffset: 0,
-                scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
-            // Multi-token shapes must run on the prefill graph when there is one. Not just
-            // to avoid compiling unused kernels: the logits buffer holds a single row in
-            // that case, so a wide warmup on `function` would overrun it.
-            if shape > 1, let prefillFn = prefillFunction {
-                try encodeWithStatesNoOutputs(
-                    function: prefillFn, inputs: asyncInputs,
+                let tokenValue = unsafe InferenceFunction.AsyncValue(
+                    unsafeBuffer: inputTokensBuffer, byteOffset: 0,
+                    scalarType: .int32, shape: tShape, strides: tStrides)
+                let posValue = unsafe InferenceFunction.AsyncValue(
+                    unsafeBuffer: cachePosBuffer, byteOffset: 0,
+                    scalarType: .int32, shape: pShape, strides: pStrides)
+                let asyncInputs: [String: InferenceFunction.AsyncValue] = [
+                    inputIdsName: tokenValue, positionIdsName: posValue,
+                ]
+
+                let keyBuffer = kvCache.keyBinding.metalBuffer
+                let kShape = kvCache.keyBinding.layout.shape
+                let kStrides = kvCache.keyBinding.layout.strides
+                let valBuffer = kvCache.valueBinding.metalBuffer
+                let vShape = kvCache.valueBinding.layout.shape
+                let vStrides = kvCache.valueBinding.layout.strides
+                var keyState = unsafe InferenceFunction.AsyncMutableValue(
+                    unsafeBuffer: keyBuffer, byteOffset: 0,
+                    scalarType: keyCacheScalarType, shape: kShape, strides: kStrides)
+                var valState = unsafe InferenceFunction.AsyncMutableValue(
+                    unsafeBuffer: valBuffer, byteOffset: 0,
+                    scalarType: valueCacheScalarType, shape: vShape, strides: vStrides)
+                // Multi-token shapes must run on the prefill graph when there is one. Not just
+                // to avoid compiling unused kernels: the logits buffer holds a single row in
+                // that case, so a wide warmup on `function` would overrun it.
+                if shape > 1, let prefillFn = prefillFunction {
+                    try encodeWithStatesNoOutputs(
+                        function: prefillFn, inputs: asyncInputs,
+                        keyState: &keyState, keyCacheName: keyCacheName,
+                        valState: &valState, valueCacheName: valueCacheName,
+                        additionalStates: additionalStates,
+                        computeStream: computeStream)
+                    step += 1
+                    continue
+                }
+
+                let lShape = [1, shape, vocabSize]
+                try encodeWithStates(
+                    function: function, inputs: asyncInputs,
                     keyState: &keyState, keyCacheName: keyCacheName,
                     valState: &valState, valueCacheName: valueCacheName,
                     additionalStates: additionalStates,
+                    logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
+                    logitsShape: lShape,
+                    logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
                     computeStream: computeStream)
-                step += 1
-                continue
-            }
 
-            let lShape = [1, shape, vocabSize]
-            try encodeWithStates(
-                function: function, inputs: asyncInputs,
-                keyState: &keyState, keyCacheName: keyCacheName,
-                valState: &valState, valueCacheName: valueCacheName,
-                additionalStates: additionalStates,
-                logitsBuffer: logits.metalBuffer, logitsName: logitsOutputName,
-                logitsShape: lShape,
-                logitsStrides: try resolvedStrides(descriptor: logitsBaseDesc, shape: lShape),
-                computeStream: computeStream)
+                // Warm up argmax kernel using pipeline-matched decode buffers
+                let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]
+                let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
+                let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
 
-            // Warm up argmax kernel using pipeline-matched decode buffers
-            let warmupLogitsBuffer = decodeLogitsBuffers[step % pipelineDepth]
-            let warmupOutputBuffer = decodeOutputBuffers[step % pipelineDepth]
-            let logitsOffset = (shape - 1) * vocabSize * MemoryLayout<UInt16>.size
-
-            do {
-                let queue = pipelineQueue
-                var error: Error?
                 try warmupSampler.encode(
-                    to: queue,
+                    to: pipelineQueue,
                     logitsBuffer: warmupLogitsBuffer,
                     logitsOffset: logitsOffset,
                     outputBuffer: warmupOutputBuffer,
                     outputOffset: 0,
-                    completion: { _, e in
-                        error = e
+                    completion: { _, error in
+                        if let error { failures.record(GPUCommandBufferError.wrapping(error)) }
                     }
                 )
-                if let error {
-                    throw error
-                }
-            }
 
-            step += 1
+                step += 1
+            }
+        } catch {
+            // Let the work already committed finish before the engine is reset or handed back.
+            await computeStream.currentWorkCompleted()
+            await drainPipelineQueue()
+            reset()
+            warmupSpan.end()
+            throw gpuFailures.failure ?? error
         }
 
+        // Every warmup command buffer, and every sampler callback, has completed after this.
         await computeStream.currentWorkCompleted()
+        await drainPipelineQueue()
         reset()
+
+        // A model that runs the GPU out of memory in warmup won't fit for generation either.
+        if let failure = gpuFailures.failure {
+            warmupSpan.end()
+            throw failure
+        }
 
         warmupSpan.end()
         let warmupElapsed = milliseconds(since: warmupStart)

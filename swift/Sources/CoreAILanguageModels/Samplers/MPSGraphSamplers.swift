@@ -93,6 +93,36 @@ extension MPSGraphSampler {
     }
 }
 
+// MARK: - Blit Failures
+
+/// `completion`, reporting the failure of `blit` in place of a token when the blit failed.
+///
+/// The slice paths copy the last row of logits with a blit committed just before the sampling
+/// graph, on the same queue. The graph's command buffer completes after the blit's, so its
+/// completion handler can read the blit's final status; a failed copy would otherwise be
+/// sampled as if it held logits. The check adds no completed handler to the blit.
+func samplerCompletion(
+    _ completion: @escaping (Int32, Error?) -> Void,
+    reportingFailureOf blit: any MTLCommandBuffer
+) -> (Int32, Error?) -> Void {
+    samplerCompletion(completion, reportingFailure: { GPUCommandBufferError(checking: blit) })
+}
+
+/// `completion`, reporting `failure()` in place of a token when it isn't nil. A sampler
+/// error passed to the returned closure is passed on unchanged.
+func samplerCompletion(
+    _ completion: @escaping (Int32, Error?) -> Void,
+    reportingFailure failure: @escaping () -> GPUCommandBufferError?
+) -> (Int32, Error?) -> Void {
+    { token, error in
+        if error == nil, let failure = failure() {
+            completion(0, failure)
+            return
+        }
+        completion(token, error)
+    }
+}
+
 // MARK: - Sampler Factory
 
 /// Factory for creating the appropriate MPSGraph sampler based on configuration.
@@ -460,7 +490,8 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             try encode(
                 to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: outputOffset,
-                applyBitmask: applyBitmask, completion: completion)
+                applyBitmask: applyBitmask,
+                completion: samplerCompletion(completion, reportingFailureOf: blitCmdBuffer))
         } catch {
             completion(0, error)
         }
@@ -618,6 +649,7 @@ final class MPSGraphArgmaxSampler: @unchecked Sendable {
             dataType: .int32
         )
 
+        let completion = samplerCompletion(completion, reportingFailureOf: blitCmdBuffer)
         let execDescriptor = MPSGraphExecutableExecutionDescriptor()
         execDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if error != nil {
@@ -1135,7 +1167,8 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
             try encode(
                 to: queue, logitsBuffer: tempBuffer, logitsOffset: 0,
                 outputBuffer: outputBuffer, outputOffset: outputOffset,
-                applyBitmask: applyBitmask, completion: completion)
+                applyBitmask: applyBitmask,
+                completion: samplerCompletion(completion, reportingFailureOf: blitCmdBuffer))
         } catch {
             completion(0, error)
         }
@@ -1316,6 +1349,7 @@ final class MPSGraphCompositeSampler: @unchecked Sendable {
         let logitsData = MPSGraphTensorData(tempBuffer, shape: [1, vocabSize as NSNumber], dataType: .float16)
         let outputData = MPSGraphTensorData(outputBuffer, shape: [1 as NSNumber], dataType: .int32)
 
+        let completion = samplerCompletion(completion, reportingFailureOf: blitCmdBuffer)
         let prefillExecDescriptor = MPSGraphExecutableExecutionDescriptor()
         prefillExecDescriptor.completionHandler = { [outputBuffer, outputOffset] (_, error) in
             if error != nil {

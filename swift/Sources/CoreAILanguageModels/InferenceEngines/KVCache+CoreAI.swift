@@ -55,29 +55,16 @@ protocol CoreAIKVCache {
     /// Ensure capacity for context length. Returns true if reallocation occurred.
     /// When true is returned, executables must be rebound to the new buffers.
     ///
+    /// A growing cache commits the copy into the new buffers on `queue` and doesn't wait for it.
+    /// The queue is a `MonitoredCommandQueue` so a failed copy is reported like any other GPU
+    /// failure; the step that reads the grown cache would otherwise run on unwritten memory.
+    ///
     /// - Parameters:
     ///   - contextLength: Required capacity in tokens
-    ///   - queue: Metal command queue for blit operations (if needed)
+    ///   - queue: Command queue for the copy (if needed)
     /// - Returns: true if buffers were reallocated and need rebinding
     /// - Throws: `KVCacheError.capacityExceeded` if static cache cannot accommodate contextLength
-    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MTLCommandQueue) throws -> Bool
-
-    /// Encode pipelined expansion onto a command buffer WITHOUT committing.
-    /// Returns the old key/value buffers that must be kept alive until GPU completes.
-    ///
-    /// This is the pipelined alternative to `ensureCapacity()` — it encodes the copy
-    /// operation onto the provided command buffer so it can be pipelined with other GPU work.
-    /// No `waitUntilCompleted` is called.
-    ///
-    /// - Parameters:
-    ///   - contextLength: Required capacity in tokens
-    ///   - commandBuffer: Command buffer to encode onto (not committed)
-    /// - Returns: Old buffers (key, value) that must be retained until GPU completes, or nil if no growth needed
-    /// - Throws: `KVCacheError.capacityExceeded` if growth is not possible
-    mutating func encodePipelinedExpansion(
-        forContextLength contextLength: Int,
-        commandBuffer: any MTLCommandBuffer
-    ) throws -> (oldKeyBuffer: MTLBuffer, oldValueBuffer: MTLBuffer)?
+    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MonitoredCommandQueue) throws -> Bool
 }
 
 // MARK: - CoreAIKVCache Factory
@@ -275,7 +262,7 @@ struct StaticKVCache: CoreAIKVCache {
         )
     }
 
-    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MTLCommandQueue) throws -> Bool {
+    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MonitoredCommandQueue) throws -> Bool {
         guard contextLength <= currentCapacity else {
             throw KVCacheError.capacityExceeded(
                 needed: contextLength,
@@ -283,19 +270,6 @@ struct StaticKVCache: CoreAIKVCache {
             )
         }
         return false  // Static cache never grows
-    }
-
-    mutating func encodePipelinedExpansion(
-        forContextLength contextLength: Int,
-        commandBuffer: any MTLCommandBuffer
-    ) throws -> (oldKeyBuffer: MTLBuffer, oldValueBuffer: MTLBuffer)? {
-        guard contextLength <= currentCapacity else {
-            throw KVCacheError.capacityExceeded(
-                needed: contextLength,
-                available: currentCapacity
-            )
-        }
-        return nil  // Static cache never grows
     }
 }
 
@@ -388,12 +362,11 @@ struct GrowingKVCache: CoreAIKVCache {
         )
     }
 
-    /// Ensure capacity for context length (asynchronous convenience wrapper).
+    /// Ensure capacity for context length (asynchronous: the copy is committed, not awaited).
     ///
-    /// Wraps `encodePipelinedExpansion()` + commit
-    /// Used by warmup and prompt pre-growth which has Core AI's compute stream.
-    ///
-    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MTLCommandQueue) throws -> Bool {
+    /// Makes a command buffer from the monitored `queue` and hands it to
+    /// `encodePipelinedExpansion()`, which commits it.
+    mutating func ensureCapacity(forContextLength contextLength: Int, queue: MonitoredCommandQueue) throws -> Bool {
         guard contextLength > currentCapacity else { return false }
 
         guard let cmd = queue.makeCommandBuffer() else {
@@ -406,17 +379,18 @@ struct GrowingKVCache: CoreAIKVCache {
         return true
     }
 
-    /// Encode pipelined expansion onto a command buffer WITHOUT committing.
+    /// Encode pipelined expansion onto `commandBuffer` and commit it.
     ///
     /// Uses MPSNDArrayIdentity with sliced array views to encode the strided copy
     /// directly onto the command buffer. No waitUntilCompleted is called.
+    /// `commandBuffer` must come from a `MonitoredCommandQueue` (see `ensureCapacity`).
     ///
     /// Approach: Flattens [L,B,H] into 3D `[L*B*H, S, D]`, slices destination's S dimension,
     /// then uses a cached identity kernel to copy source → sliced destination in one operation.
     ///
-    /// Returns the old buffers that must be retained (via ARC capture in completion handler)
-    /// until GPU completes the copy.
-    mutating func encodePipelinedExpansion(
+    /// Returns the old buffers, or nil when no growth was needed. The command buffer keeps
+    /// the buffers it reads alive until the copy completes.
+    private mutating func encodePipelinedExpansion(
         forContextLength contextLength: Int,
         commandBuffer: any MTLCommandBuffer
     ) throws -> (oldKeyBuffer: MTLBuffer, oldValueBuffer: MTLBuffer)? {
