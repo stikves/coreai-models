@@ -164,7 +164,7 @@ extension PipelinedConstrainedSequence {
         /// The engine's stream, for why it ended when it ends without an error.
         private var engineStream: InferenceTokenSequence?
         private var generatedTokens: [Int32] = []
-        private var previousDecodedText: String = ""
+        private var detokenizer: IncrementalDetokenizer
         private var recentTokens: [Int32] = []
         private var finished: Bool = false
         private let outcome: StopReasonStore
@@ -187,6 +187,7 @@ extension PipelinedConstrainedSequence {
             self.inputTokens = inputTokens
             self.maxTokens = maxTokens
             self.tokenizer = tokenizer
+            self.detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
             self.engine = engine
             self.samplingConfiguration = samplingConfiguration
             self.stopSequences = stopSequences
@@ -243,15 +244,9 @@ extension PipelinedConstrainedSequence {
                         return nil
                     }
 
-                    // Decode text incrementally
                     generatedTokens.append(tokenId)
-                    let fullDecode = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
-                    // Compare Unicode scalars: a Character-wise prefix re-emits the grapheme a token extends.
-                    let fullScalars = fullDecode.unicodeScalars
-                    let common = zip(fullScalars, previousDecodedText.unicodeScalars).prefix(while: { $0 == $1 }).count
-                    let delta = String(String.UnicodeScalarView(fullScalars.dropFirst(common)))
-
-                    if delta.unicodeScalars.contains(where: { $0 == "\u{FFFD}" }) {
+                    let delta = detokenizer.append(Int(tokenId))
+                    if detokenizer.isIncomplete {
                         consecutiveDecodeFailures += 1
                         if consecutiveDecodeFailures >= maxConsecutiveDecodeFailures {
                             throw InferenceRuntimeError.invalidState(
@@ -261,8 +256,6 @@ extension PipelinedConstrainedSequence {
                         continue
                     }
                     consecutiveDecodeFailures = 0
-
-                    previousDecodedText = fullDecode
 
                     if !delta.isEmpty {
                         return GenerationResult(text: delta, tokenId: tokenId, rawLogits: nil)

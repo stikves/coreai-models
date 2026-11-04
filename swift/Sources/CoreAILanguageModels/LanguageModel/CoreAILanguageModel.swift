@@ -347,14 +347,7 @@ public struct CoreAILanguageModel: LanguageModel {
             )
 
             let eosTokens = tokenizer.runtimeStopTokens(additional: model.additionalEosTokenIds)
-            // Incremental-decode buffer. After a clean emit, one token is
-            // retained as context for the next step (see below). During a
-            // multi-byte sequence that hasn't decoded cleanly yet, multiple
-            // tokens accumulate until the sequence is complete. In the steady
-            // state the buffer holds at most 2 tokens, so tokenizer.decode
-            // is O(1) per step.
-            var pendingTokens: [Int32] = []
-            var previousDecodedText: String = ""
+            var detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
             var tokenStep: Int = 0
             // Segments the decoded stream into `.text` and `.reasoning`
             // events on the fly. Reasoning content (model's chain-of-thought
@@ -384,55 +377,25 @@ public struct CoreAILanguageModel: LanguageModel {
                     break
                 }
 
-                pendingTokens.append(token)
                 tokenStep += 1
                 generatedTokenCount += 1
 
                 let decodeSpan = InstrumentsProfiler.beginDecode(step: tokenStep)
-                let decodedText = tokenizer.decode(tokens: pendingTokens.map { Int($0) })
+                let delta = detokenizer.append(Int(token))
                 decodeSpan.end()
 
-                let common = decodedText.commonPrefix(with: previousDecodedText)
-                let delta = String(decodedText.dropFirst(common.count))
-                // Check for replacement char on the full `decodedText`, not on
-                // `delta`. Some tokenizers emit one U+FFFD per attempted decode
-                // of an incomplete multi-byte sequence (rather than one per
-                // bad byte), so two consecutive partial tokens can produce
-                // identical "\u{FFFD}" strings — making `delta` empty and
-                // hiding the still-incomplete state. Checking `decodedText`
-                // catches that case.
-                let hasReplacementChar = decodedText.unicodeScalars.contains { $0 == "\u{FFFD}" }
-
-                if hasReplacementChar {
-                    // UTF-8 bytes don't form a clean character yet. Hold the
-                    // token and wait for the next iteration to extend the
-                    // buffer; don't drop or advance.
+                if detokenizer.isIncomplete {
+                    // UTF-8 bytes don't form a clean character yet; the
+                    // detokenizer holds the token until a later one completes it.
                     await channel.send(
                         .response(action: .appendText("", tokenCount: 1))
                     )
-                    previousDecodedText = decodedText
                     continue
                 }
 
                 for event in thinkParser.consume(delta) {
                     if case .reasoning = event { reasoningTokenCount += 1 }
                     await dispatch(event: event, toolCallParser: &toolCallParser, channel: channel)
-                }
-
-                // Retain the last token as O(1) context for the next decode.
-                // SentencePiece needs at least one prior token to infer the leading
-                // ▁ (space) on the following token; clearing to empty decodes each
-                // new token in isolation and drops inter-word spaces.
-                // Keeping one token bounds re-decode cost to 2 tokens per step.
-                // Safe for all supported tokenizers: decode([last]) is a prefix of
-                // decode([last, next]) when addPrefixSpace=true (Mistral, Llama, Qwen)
-                // and for ByteLevel tokenizers (GPT-2 style) where spaces are direct bytes.
-                if let last = pendingTokens.last {
-                    pendingTokens = [last]
-                    previousDecodedText = tokenizer.decode(tokens: [Int(last)])
-                } else {
-                    pendingTokens.removeAll(keepingCapacity: true)
-                    previousDecodedText = ""
                 }
             }
 

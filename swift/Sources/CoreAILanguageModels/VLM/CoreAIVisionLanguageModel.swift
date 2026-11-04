@@ -167,26 +167,14 @@ public struct CoreAIVLMExecutor: LanguageModelExecutor {
         )
 
         var generatedCount = 0
-        var pendingTokens: [Int] = []
-        var previousText = ""
+        var detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
         for try await output in stream {
             if stopTokens.contains(output.tokenId) { break }
             generatedCount += 1
-            pendingTokens.append(Int(output.tokenId))
 
-            let decoded = tokenizer.decode(tokens: pendingTokens)
-            if decoded.unicodeScalars.contains("\u{FFFD}") {
-                previousText = decoded
-                continue
-            }
-            let common = decoded.commonPrefix(with: previousText)
-            let delta = String(decoded.dropFirst(common.count))
+            let delta = detokenizer.append(Int(output.tokenId))
             if !delta.isEmpty {
                 await channel.send(.response(action: .appendText(delta, tokenCount: 1)))
-            }
-            if let last = pendingTokens.last {
-                pendingTokens = [last]
-                previousText = tokenizer.decode(tokens: pendingTokens)
             }
         }
 

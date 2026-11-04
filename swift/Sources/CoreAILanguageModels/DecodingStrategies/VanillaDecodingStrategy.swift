@@ -98,24 +98,6 @@ public struct VanillaDecodingStrategy: DecodingStrategy {
             stopSequences: stopSequences
         )
     }
-
-    // MARK: - UTF-8 Safety
-
-    /// Returns the end index of the longest prefix of `text` that contains
-    /// only complete UTF-8 characters (no trailing U+FFFD replacement chars
-    /// that indicate the tokenizer produced an incomplete byte sequence).
-    fileprivate static func safeUTF8Prefix(of text: String) -> String.Index {
-        var end = text.endIndex
-        while end > text.startIndex {
-            let prev = text.index(before: end)
-            if text[prev] == "\u{FFFD}" {
-                end = prev
-            } else {
-                break
-            }
-        }
-        return end
-    }
 }
 
 // MARK: - VanillaDecodedSequence
@@ -184,9 +166,8 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
 
         // Decoding state
         private var generatedTokenCount: Int = 0
-        private var newlyGeneratedTokens: [Int] = []
+        private var detokenizer: IncrementalDetokenizer
         private var recentTokens: [Int32] = []
-        private var pendingText: String = ""
         private var inferenceSpan: ProfileSpan?
         private var stopped: Bool = false
         private var flushed: Bool = false
@@ -205,6 +186,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
         ) {
             self.tokenizer = tokenizer
             self.stopSequences = stopSequences
+            self.detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
             self.initialInputTokenCount = prepared.initialInputTokenCount
             self.outcome = prepared.outcome
             self.tokenCount = prepared.tokenCount
@@ -257,31 +239,7 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                             + "tokenizer (last \(output.tokenId)), after \(generatedTokenCount) token(s)")
                 }
 
-                var newText = ""
-                if known {
-                    newlyGeneratedTokens.append(Int(output.tokenId))
-                    let fullDecode = tokenizer.decode(tokens: newlyGeneratedTokens)
-
-                    let safeEnd = VanillaDecodingStrategy.safeUTF8Prefix(of: fullDecode)
-                    let emittable = String(fullDecode[fullDecode.startIndex..<safeEnd])
-
-                    // Compare Unicode scalars, not Characters: a token that merges into the previous grapheme
-                    // (ZWJ emoji, combining marks, Indic vowel signs) leaves the Character count unchanged.
-                    let emittedScalars = emittable.unicodeScalars
-                    let pendingScalars = pendingText.unicodeScalars
-                    if emittedScalars.count > pendingScalars.count, emittedScalars.starts(with: pendingScalars) {
-                        newText = String(String.UnicodeScalarView(emittedScalars.dropFirst(pendingScalars.count)))
-                        pendingText = emittable
-                    } else if emittable != pendingText {
-                        newText = emittable
-                        pendingText = emittable
-                    }
-
-                    if newText.hasSuffix("\n") {
-                        newlyGeneratedTokens = []
-                        pendingText = ""
-                    }
-                }
+                let newText = known ? detokenizer.append(Int(output.tokenId)) : ""
 
                 recentTokens.append(output.tokenId)
                 if recentTokens.count > stopSequences.maxLength {
@@ -310,8 +268,9 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
                     engineSequence = nil
                     upstreamIterator = nil
 
-                    // Flush any buffered text and record metrics — flushTrailingText()
-                    // sets `flushed`, so subsequent next() calls return nil.
+                    // Drop the stop token's text, including any held with it, then record metrics —
+                    // flushTrailingText() sets `flushed`, so subsequent next() calls return nil.
+                    _ = detokenizer.flush()
                     return try await flushTrailingText()
                 }
 
@@ -363,19 +322,8 @@ extension VanillaDecodingStrategy.VanillaDecodedSequence {
             }
             flushed = true
 
-            let finalDecode = tokenizer.decode(tokens: newlyGeneratedTokens)
-            let trailing: GenerationResult?
-            let finalScalars = finalDecode.unicodeScalars
-            let pendingScalars = pendingText.unicodeScalars
-            if finalScalars.count > pendingScalars.count, finalScalars.starts(with: pendingScalars) {
-                let remaining = String(String.UnicodeScalarView(finalScalars.dropFirst(pendingScalars.count)))
-                trailing =
-                    remaining.isEmpty
-                    ? nil
-                    : GenerationResult(text: remaining, tokenId: 0, rawLogits: nil)
-            } else {
-                trailing = nil
-            }
+            let remaining = detokenizer.flush()
+            let trailing = remaining.isEmpty ? nil : GenerationResult(text: remaining, tokenId: 0, rawLogits: nil)
 
             await PerformanceMetrics.shared.recordGeneratedTokens(generatedTokenCount)
             return trailing

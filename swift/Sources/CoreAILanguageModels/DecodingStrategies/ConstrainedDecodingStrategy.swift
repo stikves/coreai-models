@@ -169,29 +169,6 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
         return (bestToken, logits)
     }
 
-    fileprivate static func computeTextDelta(
-        generatedTokens: [Int32],
-        previousDecodedText: inout String,
-        tokenizer: any Tokenizer,
-        tokenStep: Int
-    ) -> String {
-        let decodeSpan = InstrumentsProfiler.beginDecode(step: tokenStep)
-        let fullDecodedText = tokenizer.decode(tokens: generatedTokens.map { Int($0) })
-        decodeSpan.end()
-
-        // Compare Unicode scalars: a Character-wise prefix re-emits the grapheme a token extends.
-        let fullScalars = fullDecodedText.unicodeScalars
-        let common = zip(fullScalars, previousDecodedText.unicodeScalars).prefix(while: { $0 == $1 }).count
-        let delta = String(String.UnicodeScalarView(fullScalars.dropFirst(common)))
-
-        if delta.unicodeScalars.contains(where: { $0 == "\u{FFFD}" }) {
-            return ""
-        }
-
-        previousDecodedText = fullDecodedText
-        return delta
-    }
-
     // MARK: - Vocabulary size derivation
 
     /// Derive vocabulary size from a tokenizer using binary search.
@@ -288,7 +265,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
         private var inputTokens: [Int32]
         private let maxTokens: Int
         private var generatedTokens: [Int32] = []
-        private var previousDecodedText: String = ""
+        private var detokenizer: IncrementalDetokenizer
         private var tokenStep: Int = 0
         private var finished: Bool = false
         private let outcome: StopReasonStore
@@ -308,6 +285,7 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
             self.outcome = prepared.outcome
             self.tokenCount = prepared.tokenCount
             self.tokenizer = tokenizer
+            self.detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
             self.inferenceEngine = inferenceEngine
             self.samplingConfiguration = samplingConfiguration
             self.stopSequences = stopSequences
@@ -377,12 +355,9 @@ extension ConstrainedDecodingStrategy.ConstrainedDecodedSequence {
                     return nil
                 }
 
-                let delta = ConstrainedDecodingStrategy.computeTextDelta(
-                    generatedTokens: generatedTokens,
-                    previousDecodedText: &previousDecodedText,
-                    tokenizer: tokenizer,
-                    tokenStep: tokenStep
-                )
+                let decodeSpan = InstrumentsProfiler.beginDecode(step: tokenStep)
+                let delta = detokenizer.append(Int(bestToken))
+                decodeSpan.end()
 
                 return GenerationResult(text: delta, tokenId: bestToken, rawLogits: logits)
             }

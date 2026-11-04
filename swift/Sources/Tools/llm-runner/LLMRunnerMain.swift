@@ -795,15 +795,10 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
             "\nGenerating (speculative, drafter=\(drafterLabel), k=\(numDraftTokens)\(adaptive ? " adaptive" : ""), \(useGreedy ? "greedy" : "sampling T=\(temperature)"))...\n"
         )
 
-        var generatedIds: [Int] = []
-        var previousText = ""
+        var detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
         let onToken: (Int32) -> Void = { token in
             if !stopTokenIds.contains(token) {
-                generatedIds.append(Int(token))
-                let full = tokenizer.decode(tokens: generatedIds)
-                let delta = String(full.dropFirst(previousText.count))
-                previousText = full
-                print(delta, terminator: "")
+                print(detokenizer.append(Int(token)), terminator: "")
                 fflush(stdout)
             }
         }
@@ -1783,7 +1778,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
 
         var generatedTokens: [Int] = []
         var allTokenLogits: [TokenLogits] = []
-        var previousText = ""
+        var detokenizer = IncrementalDetokenizer(tokenizer: tokenizer)
         for try await output in tokenStream {
             if promptSpan != nil {
                 promptSpan?.end()
@@ -1812,10 +1807,7 @@ struct LLMRunner: AsyncParsableCommand, Sendable {
                 }
             }
 
-            let fullText = tokenizer.decode(tokens: generatedTokens)
-            let delta = String(fullText.dropFirst(previousText.count))
-            previousText = fullText
-            print(delta, terminator: "")
+            print(detokenizer.append(Int(token)), terminator: "")
             fflush(stdout)
         }
         promptSpan?.end()
