@@ -455,6 +455,31 @@ struct CompositeSamplerTests {
         }
     }
 
+    @Test(
+        "Large vocab: fused paths return the reference token",
+        arguments: [
+            SamplingConfiguration(temperature: 0.8, topP: 0.9),
+            SamplingConfiguration(temperature: 0.8, minP: 0.05),
+            SamplingConfiguration(temperature: 0.8, topK: 50, topP: 0.9, minP: 0.05),
+            SamplingConfiguration(temperature: 0.8),
+        ])
+    func largeVocabMatchesReference(config: SamplingConfiguration) {
+        var gen = Xoshiro256StarStar(seed: 0x15_1936)
+        for row in 0..<2 {
+            // fp16 logits, so equal values are common.
+            let logits = (0..<151_936).map { _ in Float16(Float.random(in: -12...12, using: &gen)) }
+            for draw in 0..<2 {
+                var fusedRNG = Xoshiro256StarStar(seed: UInt64(row * 2 + draw))
+                var referenceRNG = fusedRNG
+                var half = logits
+                var widened = logits.map { Float($0) }
+                let fused = CompositeSampler.sample(from: &half, config: config, using: &fusedRNG)
+                let reference = CompositeSampler.sampleReference(&widened, config: config, using: &referenceRNG)
+                #expect(fused == reference, "row \(row) draw \(draw)")
+            }
+        }
+    }
+
     // MARK: - Test helpers
 
     /// Build a Float32 logits array of `vocab` length where `allowed` indices hold `fill`

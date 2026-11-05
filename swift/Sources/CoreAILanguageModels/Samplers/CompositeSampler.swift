@@ -10,11 +10,11 @@ import os.signpost
 /// Unified CPU sampler supporting greedy, temperature, topK, topP, and minP sampling.
 ///
 /// This sampler uses Float32 internally for all non-greedy sampling to ensure
-/// numerical precision. The Float16 → Float32 conversion happens once at entry,
-/// avoiding repeated conversions during softmax and probability calculations.
+/// numerical precision. Float16 rows are widened chunk by chunk as they are read.
+/// The fused passes in `CompositeSampler+Fused.swift` return exactly what the reference
+/// path below (`sampleReference`) returns.
 ///
-/// - Note: This implementation prioritizes correctness and precision over raw performance.
-///         Engines should prefer GPU based samplers when possible.
+/// - Note: Engines should prefer GPU based samplers when possible.
 ///
 /// ## Supported Configurations
 /// - **Greedy** (temperature=0): Argmax, no conversion needed
@@ -60,8 +60,7 @@ public struct CompositeSampler {
         if config.temperature == 0 {
             return greedySampleFloat16(&logits)
         }
-        var logitsF32 = convertFloat16ToFloat32(&logits)
-        return sampleFloat32(&logitsF32, config: config, using: &rng)
+        return logits.withUnsafeBytes { sampleRow($0, isHalf: true, config: config, using: &rng) }
     }
     #endif
 
@@ -90,7 +89,7 @@ public struct CompositeSampler {
         if config.temperature == 0 {
             return greedySampleFloat32(&logits)
         }
-        return sampleFloat32(&logits, config: config, using: &rng)
+        return logits.withUnsafeBytes { sampleRow($0, isHalf: false, config: config, using: &rng) }
     }
 
     // MARK: - Validation
@@ -114,8 +113,8 @@ public struct CompositeSampler {
     // MARK: - Greedy Sampling (Argmax)
 
     /// Greedy sampling on Float16 logits - returns index of maximum value.
-    /// Converts to Float32 via vImage and uses vDSP_maxvi (faster than the
-    /// pure-Swift `logits.enumerated().max(by:)` for vocab-sized arrays).
+    /// Widens into per-thread scratch via vImage and uses vDSP_maxvi over the whole row
+    /// (`vDSP_maxvi`'s NaN handling depends on where the NaN sits, so the row is not split).
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     private static func greedySampleFloat16(_ logits: inout [Float16]) -> Int32 {
         let span = InstrumentsProfiler.beginSample(strategy: "greedy", temperature: 0)
@@ -126,7 +125,9 @@ public struct CompositeSampler {
             return 0
         }
 
-        let logitsF32 = convertFloat16ToFloat32(&logits)
+        let scratch = Scratch.current
+        let logitsF32 = scratch.row.reserve(count)
+        logits.withUnsafeBytes { Row($0, isHalf: true, chunk: scratch.chunk).copy(into: logitsF32) }
 
         var maxVal: Float = 0
         var maxIdx: vDSP_Length = 0
@@ -157,7 +158,57 @@ public struct CompositeSampler {
 
     // MARK: - Composite Sampling (Float32 internal)
 
-    /// Full sampling pipeline in Float32. Two paths:
+    /// Non-greedy sampling of one row: the fused passes, or the reference when they cannot decide.
+    private static func sampleRow(
+        _ bytes: UnsafeRawBufferPointer,
+        isHalf: Bool,
+        config: SamplingConfiguration,
+        using rng: inout some RandomNumberGenerator
+    ) -> Int32 {
+        let span = InstrumentsProfiler.beginSample(strategy: describeStrategy(config), temperature: config.temperature)
+        let scratch = Scratch.current
+        let row = Row(bytes, isHalf: isHalf, chunk: scratch.chunk)
+        var token: Int32
+        if let fused = sampleFused(row, config: config, scratch: scratch, using: &rng) {
+            token = fused
+        } else {
+            var logitsF32 = row.array()
+            token = sampleReference(&logitsF32, config: config, using: &rng)
+        }
+        span.end()
+        return token
+    }
+
+    private static func sampleFused(
+        _ row: Row,
+        config: SamplingConfiguration,
+        scratch: Scratch,
+        using rng: inout some RandomNumberGenerator
+    ) -> Int32? {
+        let temperature = Float(config.temperature)
+        let topP = config.topP.map { Float($0) }
+        let minP = config.minP.map { Float($0) }
+        // Degenerate rows and parameters go to the reference.
+        guard row.count > 0, temperature.isNormal, minP.map({ $0 > 0 && $0 <= 1 }) ?? true else { return nil }
+
+        let filtered = config.topK != nil || minP != nil || (config.topP.map { $0 < 1.0 } ?? false)
+        guard filtered else {
+            return sampleTemperature(row, temperature: temperature, scratch: scratch, using: &rng)
+        }
+        guard
+            let n = selectActive(
+                row, temperature: temperature, topK: config.topK, topP: topP, minP: minP, scratch: scratch)
+        else { return nil }
+        // Degenerate: empty active set (e.g. all logits -.infinity). Fall back to index 0.
+        guard n > 0 else { return 0 }
+        let active = scratch.candidates.base!
+        var activeLogits = (0..<n).map { active[$0].z }
+        softmaxVectorized(&activeLogits)
+        let localIdx = multinomialSample(activeLogits, using: &rng)
+        return active[localIdx].i
+    }
+
+    /// Reference sampling pipeline in Float32 (scratch: `logits` is overwritten). Two paths:
     ///
     /// **Fast path** — no topK/topP/minP: vectorized softmax + multinomial over the full vocab.
     /// **Slow path** — topK, topP, and/or minP set: identify the active subset (typically 5-500 tokens),
@@ -167,15 +218,12 @@ public struct CompositeSampler {
     /// Guided generation works through either path: GrammarEngine pre-masks logits with
     /// `-Float.infinity` (or `-Float16.greatestFiniteMagnitude` for fp16). Those positions
     /// have exp() = 0 and never enter the active subset.
-    private static func sampleFloat32(
+    static func sampleReference(
         _ logits: inout [Float],
         config: SamplingConfiguration,
         using rng: inout some RandomNumberGenerator
     ) -> Int32 {
         let vocabSize = logits.count
-        let strategyName = describeStrategy(config)
-
-        let span = InstrumentsProfiler.beginSample(strategy: strategyName, temperature: config.temperature)
 
         var temp = Float(config.temperature)
         vDSP_vsdiv(logits, 1, &temp, &logits, 1, vDSP_Length(vocabSize))
@@ -187,9 +235,7 @@ public struct CompositeSampler {
         if !needsTopP && !needsTopK && !needsMinP {
             // Fast path: vectorized softmax + multinomial over the full vocab.
             softmaxVectorized(&logits)
-            let token = Int32(multinomialSample(logits, using: &rng))
-            span.end()
-            return token
+            return Int32(multinomialSample(logits, using: &rng))
         }
 
         // Slow path: compact-then-sample.
@@ -200,17 +246,12 @@ public struct CompositeSampler {
             minP: config.minP.map { Float($0) })
 
         // Degenerate: empty active set (e.g. all logits -.infinity). Fall back to index 0.
-        guard !activeIndices.isEmpty else {
-            span.end()
-            return 0
-        }
+        guard !activeIndices.isEmpty else { return 0 }
 
         var activeLogits = activeIndices.map { logits[$0] }
         softmaxVectorized(&activeLogits)
         let localIdx = multinomialSample(activeLogits, using: &rng)
-        let token = Int32(activeIndices[localIdx])
-        span.end()
-        return token
+        return Int32(activeIndices[localIdx])
     }
 
     /// Vectorized softmax using vDSP. Operates in-place on the entire buffer.
@@ -381,34 +422,6 @@ public struct CompositeSampler {
     }
 
     // MARK: - Helpers
-
-    /// Vectorized Float16 → Float32 conversion via vImage's Planar16F → PlanarF.
-    /// Centralizes the conversion used by both the temperature entry path and the
-    /// fp16 greedy path.
-    #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
-    private static func convertFloat16ToFloat32(_ logits: inout [Float16]) -> [Float] {
-        let count = logits.count
-        var logitsF32 = [Float](repeating: 0, count: count)
-        logits.withUnsafeMutableBufferPointer { src in
-            logitsF32.withUnsafeMutableBufferPointer { dst in
-                var srcBuf = vImage_Buffer(
-                    data: src.baseAddress,
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<Float16>.stride
-                )
-                var dstBuf = vImage_Buffer(
-                    data: dst.baseAddress,
-                    height: 1,
-                    width: vImagePixelCount(count),
-                    rowBytes: count * MemoryLayout<Float>.stride
-                )
-                _ = vImageConvert_Planar16FtoPlanarF(&srcBuf, &dstBuf, 0)
-            }
-        }
-        return logitsF32
-    }
-    #endif
 
     /// Describe the sampling strategy for profiling.
     private static func describeStrategy(_ config: SamplingConfiguration) -> String {
