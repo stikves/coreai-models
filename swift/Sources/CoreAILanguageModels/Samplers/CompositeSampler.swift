@@ -112,9 +112,10 @@ public struct CompositeSampler {
 
     // MARK: - Greedy Sampling (Argmax)
 
-    /// Greedy sampling on Float16 logits - returns index of maximum value.
-    /// Widens into per-thread scratch via vImage and uses vDSP_maxvi over the whole row
-    /// (`vDSP_maxvi`'s NaN handling depends on where the NaN sits, so the row is not split).
+    /// Greedy sampling on Float16 logits - returns index of maximum value (lowest on ties).
+    /// `argmaxHalf` reads the fp16 bits directly. A row holding a NaN is widened into per-thread
+    /// scratch via vImage for vDSP_maxvi over the whole row (`vDSP_maxvi`'s NaN handling depends on
+    /// where the NaN sits, so the row is not split).
     #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
     private static func greedySampleFloat16(_ logits: inout [Float16]) -> Int32 {
         let span = InstrumentsProfiler.beginSample(strategy: "greedy", temperature: 0)
@@ -123,6 +124,10 @@ public struct CompositeSampler {
         guard count > 0 else {
             span.end()
             return 0
+        }
+        if let index = logits.withUnsafeBytes({ argmaxHalf($0) }) {
+            span.end()
+            return Int32(index)
         }
 
         let scratch = Scratch.current

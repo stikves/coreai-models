@@ -568,3 +568,65 @@ extension CompositeSampler {
         if src != c { c.update(from: src, count: n) }
     }
 }
+
+extension CompositeSampler {
+    // MARK: - Greedy (fp16)
+
+    /// Index of the largest fp16 entry, the lowest on ties (-0 == +0), as `vDSP_maxvi` picks it; nil
+    /// for an empty row or one holding a NaN. Works on raw bits, which LLVM vectorizes without
+    /// widening, one chunk at a time so the first-index search reads L1-resident data.
+    static func argmaxHalf(_ bytes: UnsafeRawBufferPointer) -> Int? {
+        let n = bytes.count / 2
+        guard n > 0, let base = bytes.baseAddress else { return nil }
+        return base.withMemoryRebound(to: UInt16.self, capacity: n) { h -> Int? in
+            var bestKey = Int.min
+            var bestIndex = 0
+            var offset = 0
+            while offset < n {
+                let p = h + offset
+                let length = min(Row.chunkSize, n - offset)
+                defer { offset += length }
+                // Signed max of the bits: the largest entry if any has its sign bit clear, and above
+                // 0x7C00 for a positive NaN. Unsigned max: above 0xFC00 for a negative NaN.
+                var top = Int16.min
+                var high: UInt16 = 0
+                for j in 0..<length {
+                    top = max(top, Int16(bitPattern: p[j]))
+                    high = max(high, p[j])
+                }
+                if top > 0x7C00 || high > 0xFC00 { return nil }
+                var target = UInt16(bitPattern: top)
+                if top < 0 {
+                    // All negative: the largest has the smallest magnitude, and cannot beat a best >= -0.
+                    if bestKey >= 0 { continue }
+                    target = .max
+                    for j in 0..<length { target = min(target, p[j]) }
+                }
+                // Signed magnitude, both zeros 0; strict > keeps the earlier chunk on ties.
+                let key = target & 0x8000 == 0 ? Int(target) : -Int(target & 0x7FFF)
+                if key > bestKey {
+                    bestKey = key
+                    bestIndex = offset + firstIndex(of: target, p, length)
+                }
+            }
+            return bestIndex
+        }
+    }
+
+    /// First index whose entry equals `target` as fp16 (a zero matches either zero). `target` is present.
+    @inline(__always)
+    private static func firstIndex(of target: UInt16, _ p: UnsafePointer<UInt16>, _ n: Int) -> Int {
+        let mask: UInt16 = target & 0x7FFF == 0 ? 0x7FFF : 0xFFFF
+        let t = target & mask
+        var i = 0
+        while i + 64 <= n {
+            let b = p + i
+            var d = UInt16.max
+            for q in 0..<64 { d = min(d, (b[q] & mask) ^ t) }
+            if d == 0 { break }
+            i += 64
+        }
+        while i < n - 1 && p[i] & mask != t { i += 1 }
+        return i
+    }
+}

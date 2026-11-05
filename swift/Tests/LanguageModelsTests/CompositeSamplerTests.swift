@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import Accelerate
 import Testing
 
 @testable import CoreAILanguageModels
@@ -477,6 +478,42 @@ struct CompositeSamplerTests {
                 let reference = CompositeSampler.sampleReference(&widened, config: config, using: &referenceRNG)
                 #expect(fused == reference, "row \(row) draw \(draw)")
             }
+        }
+    }
+
+    @Test("Greedy fp16 returns vDSP_maxvi's index over the widened row")
+    func greedyHalfMatchesMaxvi() {
+        var gen = Xoshiro256StarStar(seed: 0x6EED)
+        func random(_ n: Int, _ range: ClosedRange<Float>) -> [Float16] {
+            (0..<n).map { _ in Float16(Float.random(in: range, using: &gen)) }
+        }
+        var rows = [1, 2, 7, 63, 64, 65, 4095, 4097, 151_936].map { random($0, -12...12) }
+        let n = 9000  // three chunks
+        rows.append(random(n, -8...3).map { $0.rounded(.down) })  // many ties at the max
+        rows.append([Float16](repeating: -.infinity, count: n))
+        rows.append(random(n, -12 ... -0.5))  // all negative
+        for (zero, other) in [(5000, 7000), (100, 5000), (6000, nil)] as [(Int, Int?)] {
+            var row = [Float16](repeating: -1, count: n)
+            row[zero] = -0.0
+            if let other { row[other] = 0 }
+            rows.append(row)
+        }
+        var infinities = random(n, -12...12)
+        infinities[6000] = .infinity
+        infinities[8000] = .infinity
+        rows.append(infinities)
+        for (index, bits) in [(3, 0x7E00), (8500, 0xFE00), (5000, 0x7C01)] as [(Int, UInt16)] {
+            var row = random(n, -12...12)
+            row[index] = Float16(bitPattern: bits)
+            rows.append(row)
+        }
+        for (k, row) in rows.enumerated() {
+            var half = row
+            let widened = row.map { Float($0) }
+            var maxValue: Float = 0
+            var maxIndex: vDSP_Length = 0
+            vDSP_maxvi(widened, 1, &maxValue, &maxIndex, vDSP_Length(widened.count))
+            #expect(CompositeSampler.sample(from: &half, config: .greedy) == Int32(maxIndex), "row \(k)")
         }
     }
 
