@@ -179,6 +179,25 @@ struct CompositeSamplerTests {
         }
     }
 
+    @Test("topK ties break toward the lower index, at the boundary and in draw order")
+    func topKTiesPreferLowerIndex() {
+        // k=2 over [5, 5, 6]: the boundary tie keeps index 0, not 1.
+        var rng = Xoshiro256StarStar(seed: 0x7135)
+        for _ in 0..<200 {
+            var logits: [Float] = [5, 5, 6]
+            let token = CompositeSampler.sample(from: &logits, config: .init(temperature: 1.0, topK: 2), using: &rng)
+            #expect(token != 1)
+        }
+        // Equal logits draw in index order: u < 0.5 picks index 1, u >= 0.5 picks index 2.
+        for (u, expected) in [(0.25, 1), (0.75, 2)] as [(Float, Int32)] {
+            var logits: [Float] = [-1, 2, 2]
+            var fixed = FixedUniformRNG(u: u)
+            let token = CompositeSampler.sample(
+                from: &logits, config: .init(temperature: 1.0, topK: 2), using: &fixed)
+            #expect(token == expected)
+        }
+    }
+
     // MARK: - MinP sampling
 
     @Test("minP limits the sampled set to tokens with sufficient relative probability")
@@ -459,6 +478,13 @@ struct CompositeSamplerTests {
         }
         return logits
     }
+}
+
+/// `Float.random(in: 0..<1, using:)` returns exactly `u` (it takes the low 24 bits of `next()`).
+struct FixedUniformRNG: RandomNumberGenerator {
+    let bits: UInt64
+    init(u: Float) { bits = UInt64(u * 16_777_216) }
+    mutating func next() -> UInt64 { bits }
 }
 
 // MARK: - Seeded RNG (Xoshiro256**)

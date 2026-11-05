@@ -323,6 +323,7 @@ public struct CompositeSampler {
     }
 
     /// Returns the K indices with the largest logit values, sorted descending by logit.
+    /// Equal logits order lower index first, both inside the window and at the K-th boundary.
     /// O(V log K) via a min-heap of size K storing (logit, originalIndex) pairs.
     private static func topIndicesByLogit(_ logits: [Float], k: Int) -> [Int] {
         precondition(k > 0)
@@ -343,14 +344,19 @@ public struct CompositeSampler {
             }
         }
 
-        return heap.sorted { $0.0 > $1.0 }.map { $0.1 }
+        return heap.sorted { isWorse($1, $0) }.map { $0.1 }
+    }
+
+    /// Heap order: lower logit is worse; among equal logits the higher index is worse.
+    private static func isWorse(_ a: (Float, Int), _ b: (Float, Int)) -> Bool {
+        a.0 < b.0 || (a.0 == b.0 && a.1 > b.1)
     }
 
     private static func siftUpByLogit(_ heap: inout [(Float, Int)], index: Int) {
         var i = index
         while i > 0 {
             let parent = (i - 1) / 2
-            if heap[i].0 < heap[parent].0 {
+            if isWorse(heap[i], heap[parent]) {
                 heap.swapAt(i, parent)
                 i = parent
             } else {
@@ -366,8 +372,8 @@ public struct CompositeSampler {
             let left = 2 * i + 1
             let right = 2 * i + 2
             var smallest = i
-            if left < n && heap[left].0 < heap[smallest].0 { smallest = left }
-            if right < n && heap[right].0 < heap[smallest].0 { smallest = right }
+            if left < n && isWorse(heap[left], heap[smallest]) { smallest = left }
+            if right < n && isWorse(heap[right], heap[smallest]) { smallest = right }
             if smallest == i { break }
             heap.swapAt(i, smallest)
             i = smallest
