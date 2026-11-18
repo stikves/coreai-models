@@ -1,0 +1,113 @@
+{
+  "metadata_version": "0.2",
+  "kind": "embedding",
+  "name": "clap-htsat",
+  "assets": {
+    "text_encoder": "text_encoder.aimodel",
+    "audio_encoder": "audio_encoder.aimodel"
+  },
+  "embedding": {
+    "space": {
+      "id": "laion/clap-htsat-unfused",
+      "revision": "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"
+    },
+    "dimension": 512,
+    "normalized": true,
+    "metric": "cosine",
+    "logit_scale": 18.661176681518555,
+    "compute_precision": "float32",
+    "components": {
+      "text_encoder": {
+        "asset": "text_encoder",
+        "inputs": {
+          "input_ids": "int32[B,L]",
+          "attention_mask": "int32[B,L]"
+        },
+        "outputs": {
+          "embedding": "float32[B,512]"
+        },
+        "compute_units": [
+          "gpu"
+        ],
+        "functions": [
+          {
+            "function": "text_encoder",
+            "batch": {
+              "min": 1,
+              "max": 64
+            },
+            "length": 77
+          }
+        ]
+      },
+      "audio_encoder": {
+        "asset": "audio_encoder",
+        "inputs": {
+          "input_features": "float32[B,1,1001,64]"
+        },
+        "outputs": {
+          "embedding": "float32[B,512]"
+        },
+        "compute_units": [
+          "gpu"
+        ],
+        "functions": [
+          {
+            "function": "audio_encoder",
+            "batch": {
+              "min": 1,
+              "max": 64
+            }
+          }
+        ]
+      }
+    },
+    "towers": [
+      {
+        "modality": "text",
+        "pipeline": [
+          "text_encoder"
+        ]
+      },
+      {
+        "modality": "audio",
+        "pipeline": [
+          "audio_encoder"
+        ]
+      }
+    ],
+    "text": {
+      "embedded_tokenizer": true,
+      "add_bos_token": true,
+      "add_eos_token": true,
+      "bos_token_id": 0,
+      "eos_token_id": 2,
+      "pad_token_id": 1,
+      "padding_side": "right",
+      "truncation": {
+        "max_tokens": 77,
+        "keep_eos": true
+      }
+    },
+    "audio": {
+      "sample_rate": 48000,
+      "n_fft": 1024,
+      "win_length": 1024,
+      "hop_length": 480,
+      "n_mel_bins": 64,
+      "n_frames": 1001,
+      "f_min": 50,
+      "f_max": 14000
+    }
+  },
+  "source": {
+    "model_definition": "torch",
+    "hf_model_id": "laion/clap-htsat-unfused",
+    "hf_revision": "8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a"
+  },
+  "compression": null,
+  "compilation": {
+    "date": "2026-11-18T21:20:31.785441-08:00",
+    "targets": []
+  }
+}

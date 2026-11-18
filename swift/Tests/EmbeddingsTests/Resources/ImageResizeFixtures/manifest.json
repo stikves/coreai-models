@@ -1,0 +1,81 @@
+{
+ "cases": [
+  {
+   "name": "rgb_photo_down",
+   "input": "rgb_photo_down.png",
+   "mode": "RGB",
+   "width": 100,
+   "height": 65,
+   "target_height": 48,
+   "target_width": 96,
+   "decoded": "rgb_photo_down.decoded.rgb",
+   "resized": "rgb_photo_down.resized.rgb"
+  },
+  {
+   "name": "gray_down",
+   "input": "gray_down.png",
+   "mode": "L",
+   "width": 120,
+   "height": 90,
+   "target_height": 48,
+   "target_width": 48,
+   "decoded": "gray_down.decoded.rgb",
+   "resized": "gray_down.resized.rgb"
+  },
+  {
+   "name": "rgba_semi_alpha",
+   "input": "rgba_semi_alpha.png",
+   "mode": "RGBA",
+   "width": 64,
+   "height": 64,
+   "target_height": 96,
+   "target_width": 48,
+   "decoded": "rgba_semi_alpha.decoded.rgb",
+   "resized": "rgba_semi_alpha.resized.rgb"
+  },
+  {
+   "name": "palette",
+   "input": "palette.png",
+   "mode": "P",
+   "width": 80,
+   "height": 60,
+   "target_height": 48,
+   "target_width": 48,
+   "decoded": "palette.decoded.rgb",
+   "resized": "palette.resized.rgb"
+  },
+  {
+   "name": "checker_contrast",
+   "input": "checker_contrast.png",
+   "mode": "RGB",
+   "width": 50,
+   "height": 50,
+   "target_height": 48,
+   "target_width": 96,
+   "decoded": "checker_contrast.decoded.rgb",
+   "resized": "checker_contrast.resized.rgb"
+  },
+  {
+   "name": "width_only",
+   "input": "width_only.png",
+   "mode": "RGB",
+   "width": 70,
+   "height": 48,
+   "target_height": 48,
+   "target_width": 96,
+   "decoded": "width_only.decoded.rgb",
+   "resized": "width_only.resized.rgb"
+  },
+  {
+   "name": "rgb16",
+   "input": "rgb16.png",
+   "mode": "RGB",
+   "width": 21,
+   "height": 13,
+   "target_height": 48,
+   "target_width": 48,
+   "decoded": "rgb16.decoded.rgb",
+   "resized": "rgb16.resized.rgb"
+  }
+ ]
+}

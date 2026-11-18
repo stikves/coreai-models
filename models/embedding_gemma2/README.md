@@ -64,4 +64,22 @@ A host runs a bundle as follows:
 - **Images:** the Python reference in [`embedding_gemma2_vision.py`](../../python/src/coreai_models/models/macos/embedding_gemma2_vision.py) is `aspect_ratio_preserving_size` (resize), `preprocess_resized_image`, `image_encoder`, then `build_image_inputs_embeds` on the `token_table` output, then `encoder`.
 - **Vectors:** to use a smaller Matryoshka dimension, keep the leading dimensions and L2-normalize again. Compare vectors with cosine similarity.
 
+## Running
+
+### In your iOS and macOS applications
+
+`CoreAIEmbeddings` runs either bundle and does the steps above except the prompt ones:
+
+```swift
+import CoreAIEmbeddings
+
+let model = try await EmbeddingModel(resourcesAt: URL(filePath: "coreai-models/exports/embeddinggemma-2"))
+let query = try await model.embed(["which photo shows a cat?"])[0]
+let notes = try await model.embed(texts: ["Our cat sleeps all day."])
+let photos = try await model.embed(images: images, dimensions: 256)  // a Matryoshka width
+let small = try model.truncate(notes[0], to: 256)                    // the same width, without a rerun
+```
+
+Texts go in as given, as `SentenceTransformer.encode` does without `prompt_name`; to use a task prompt, prepend one of `text.prompts` yourself (e.g. `"task: search result | query: "`); for a titled document, fill `text.document_template` yourself. Vectors of the macOS and iOS bundles share one space. The first load of the iOS bundle specializes the Neural Engine programs, which takes a few minutes; later loads use the Core AI cache.
+
 [^1]: [Documentation](https://ai.google.dev/gemma/docs/embeddinggemma) · [HuggingFace](https://huggingface.co/google/embeddinggemma-2)
