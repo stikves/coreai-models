@@ -63,13 +63,13 @@ uv run coreai.embedding.export --help
 ```swift
 import CoreAIEmbeddings
 
-let model = try await EmbeddingModel(resourcesAt: URL(filePath: "coreai-models/exports/clip-vit-b32"))
+var model = try await CoreAIEmbeddingModel(resourcesAt: URL(filePath: "coreai-models/exports/clip-vit-b32"))
 let labels = ["a photo of a cat", "a photo of a dog"]
 let texts = try await model.embed(texts: labels)
 let image = try await model.embed(images: [cgImage])[0]
 let logits = try texts.map { try Float(model.logitScale ?? 1) * image.cosine($0) }  // softmax for label probabilities
 ```
 
-`CoreAIEmbeddingImageExtractor(model:)` and `CoreAIEmbeddingTextExtractor(model:)` are Create ML transformers that drop into a CreateMLComponents pipeline in place of `ImageFeaturePrint`, e.g. `.appending(LogisticRegressionClassifier(labels:))`.
+Texts are cut at 77 tokens, as Hugging Face's `CLIPProcessor` does with truncation; such an embedding's `status` is `.truncated(tokens:limit:)`. `CoreAIEmbeddingImageExtractor(model:)` and `CoreAIEmbeddingTextExtractor(model:)` are Create ML transformers that drop into a CreateMLComponents pipeline in place of `ImageFeaturePrint`, e.g. `.appending(LogisticRegressionClassifier(labels:))`; they take a `SharedEmbeddingModel(model)`, so both can share one loaded model.
 
 [^1]: [Paper](https://arxiv.org/abs/2103.00020) · [HuggingFace](https://huggingface.co/openai/clip-vit-base-patch32)

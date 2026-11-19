@@ -162,6 +162,10 @@ import Testing
         ),
         ("matryoshka not native first", "matryoshka_dimensions", { $0["matryoshka_dimensions"] = [256, 512] }),
         ("patch keys on center_crop", "center_crop takes no", { $0.edit("image") { $0["patch_size"] = 16 } }),
+        (
+            "max_tokens past the longest function", "exceeds text_encoder's longest function",
+            { $0.edit("text.truncation") { $0["max_tokens"] = 78 } }
+        ),
     ]
 
     @Test(arguments: refusals.indices)

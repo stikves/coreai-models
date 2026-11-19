@@ -175,6 +175,14 @@ extension EmbeddingBlock: Decodable {
                     "the \(tower.modality.rawValue) pipeline ends in '\(last)', which has no embedding output")
             }
         }
+        for name in towers.first(where: { $0.modality == .text })?.pipeline ?? [] {
+            let longest = components[name]?.functions.compactMap(\.length?.upperBound).max()
+            if let longest, text.maxTokens > longest {
+                problems.append(
+                    "text.truncation.max_tokens \(text.maxTokens) exceeds \(name)'s longest function, \(longest) tokens"
+                )
+            }
+        }
         if (image != nil) != modalities.contains(.image) {
             problems.append("the image block must be present exactly with the image tower")
         }

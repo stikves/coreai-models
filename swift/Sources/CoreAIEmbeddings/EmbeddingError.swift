@@ -22,6 +22,8 @@ public enum EmbeddingError: Error, CustomStringConvertible, LocalizedError {
     case unexpectedOutput(component: String, String)
     /// Core AI failed to load or run a program on `unit`: `gpu`, `neural_engine` or `cpu`.
     case programFailed(asset: String, function: String?, unit: String, reason: String)
+    /// A `SharedEmbeddingModel` already has its `maxQueueDepth` callers waiting.
+    case queueFull(depth: Int)
 
     public var description: String {
         switch self {
@@ -42,6 +44,8 @@ public enum EmbeddingError: Error, CustomStringConvertible, LocalizedError {
         case .programFailed(let asset, let function, let unit, let reason):
             let name = function.map { "\(asset)/\($0)" } ?? asset
             return "\(name) failed on \(unit): \(reason)"
+        case .queueFull(let depth):
+            return "\(depth) calls are already waiting for the model"
         }
     }
 

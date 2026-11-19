@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import CoreAIShared
 import Foundation
 import Testing
 
@@ -11,7 +12,7 @@ import Testing
 @Suite struct EmbeddingModelTests {
     @Test func clipTextBatchesAndOrder() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("clip-vit-b32", log: log) { _, _, b, inputs in
+        var model = try FakeModels.model("clip-vit-b32", log: log) { _, _, b, inputs in
             // The row's first word id, so the output keeps the input order visible.
             let ids = inputs["input_ids"]!.ints!
             return [Float(ids[b * 77 + 1])] + [Float](repeating: 0, count: 511)
@@ -29,7 +30,7 @@ import Testing
 
     @Test func clipImageCrops() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("clip-vit-b32", log: log)
+        var model = try FakeModels.model("clip-vit-b32", log: log)
         let red = try Fixtures.image(width: 300, height: 200) { _, _ in (255, 0, 0) }
         _ = try await model.embed(images: [red, red])
         let input = try #require(await log.calls(of: "image_encoder").first?.inputs["pixel_values"])
@@ -41,7 +42,7 @@ import Testing
 
     @Test func embeddingGemma2NeuralEngineImage() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("embeddinggemma-2-ios", log: log) { component, output, _, _ in
+        var model = try FakeModels.model("embeddinggemma-2-ios", log: log) { component, output, _, _ in
             output == "soft_tokens" ? (0..<(280 * 512)).map { Float($0 / 512 + 1) } : nil
         }
         let image = try Fixtures.image(width: 64, height: 64) { x, y in (UInt8(x), UInt8(y), 0) }
@@ -67,7 +68,7 @@ import Testing
 
     @Test func embeddingGemma2GPUImageUsesSharedAsset() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("embeddinggemma-2", log: log)
+        var model = try FakeModels.model("embeddinggemma-2", log: log)
         let image = try Fixtures.image(width: 64, height: 64) { _, _ in (9, 9, 9) }
         _ = try await model.embed(images: [image])
         let calls = await log.calls
@@ -78,7 +79,7 @@ import Testing
     }
 
     @Test func widthsAndCosine() async throws {
-        let model = try FakeModels.model("embeddinggemma-2") { _, _, _, _ in [3, 4] + [Float](repeating: 0, count: 766)
+        var model = try FakeModels.model("embeddinggemma-2") { _, _, _, _ in [3, 4] + [Float](repeating: 0, count: 766)
         }
         let full = try await model.embed(["a"])[0]
         let small = try await model.embed(["a"], dimensions: 128)[0]
@@ -102,7 +103,7 @@ import Testing
 
     @Test func mixedInputsKeepTheirOrder() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("clip-vit-b32", log: log) { component, _, b, _ in
+        var model = try FakeModels.model("clip-vit-b32", log: log) { component, _, b, _ in
             [component == "text_encoder" ? Float(b + 1) : Float(-(b + 1))] + [Float](repeating: 0, count: 511)
         }
         let image = try Fixtures.image(width: 8, height: 8) { _, _ in (0, 0, 0) }
@@ -113,7 +114,7 @@ import Testing
 
     @Test func warmupRunsEveryFunction() async throws {
         let gpuLog = CallLog()
-        let gpu = try FakeModels.model("embeddinggemma-2", log: gpuLog)
+        var gpu = try FakeModels.model("embeddinggemma-2", log: gpuLog)
         try await gpu.warmup()
         let gpuCalls = await gpuLog.calls
         let text = Set(gpuCalls.filter { $0.component == "text_encoder" }.map(\.function))
@@ -125,7 +126,7 @@ import Testing
         #expect(gpuCalls.contains { $0.component == "image_encoder" })
 
         let neuralEngineLog = CallLog()
-        let neuralEngine = try FakeModels.model("embeddinggemma-2-ios", log: neuralEngineLog)
+        var neuralEngine = try FakeModels.model("embeddinggemma-2-ios", log: neuralEngineLog)
         try await neuralEngine.warmup([.text])
         let encoder = Set(await neuralEngineLog.calls(of: "encoder").map(\.function))
         #expect(encoder == ["embeds_len128_b1", "embeds_len512_b1", "embeds_len1024_b1"])
@@ -134,9 +135,9 @@ import Testing
 
     @Test func cancelledEmbedThrowsBeforeAnyProgramCall() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("clip-vit-b32", log: log)
         let image = try Fixtures.image(width: 8, height: 8) { _, _ in (0, 0, 0) }
         let task = Task {
+            var model = try FakeModels.model("clip-vit-b32", log: log)
             withUnsafeCurrentTask { $0?.cancel() }
             return try await model.embed(["a", .image(image)])
         }
@@ -145,36 +146,80 @@ import Testing
     }
 
     @Test func embeddingRoundTripsThroughCodable() async throws {
-        let model = try FakeModels.model("clip-vit-b32")
+        var model = try FakeModels.model("clip-vit-b32")
         let e = try await model.embed(["a"])[0]
         let decoded = try JSONDecoder().decode(Embedding.self, from: JSONEncoder().encode(e))
         #expect(decoded == e)
         #expect(decoded.space.id == "openai/clip-vit-base-patch32")
     }
 
-    @Test func truncationKeepsEos() async throws {
+    @Test func truncationKeepsEosAndSetsStatus() async throws {
         let log = CallLog()
-        let model = try FakeModels.model("clip-vit-b32", log: log)
-        _ = try await model.embed([.text(Array(repeating: "w", count: 100).joined(separator: " "))])
+        let block = try Fixtures.block("clip-vit-b32")
+        let text = try await FakeModels.clipText(block.text)
+        var model = try FakeModels.model("clip-vit-b32", log: log, text: text)
+        let long = Array(repeating: "w", count: 100).joined(separator: " ")
+        let image = try Fixtures.image(width: 8, height: 8) { _, _ in (0, 0, 0) }
+        let vectors = try await model.embed([.text(long), "a b", .image(image)])
+        #expect(vectors.map(\.status) == [.truncated(tokens: 102, limit: 77), .complete, .complete])
+        // The cut and the in-limit ids are those of `CLIPTokenizer.encodeWithMask`.
+        let clip = try CLIPTokenizer(vocab: FakeModels.clipVocab, merges: [])
         let inputs = try #require(await log.calls(of: "text_encoder").first?.inputs)
         let ids = try #require(inputs["input_ids"]?.ints)
-        #expect(ids.count == 77 && ids.first == 49406 && ids.last == 49407)
-        #expect(inputs["attention_mask"]?.ints?.reduce(0, +) == 77)
+        #expect(Array(ids[0..<77]) == clip.encodeWithMask(long).ids)
+        #expect(ids.count == 2 * 77 && ids.last == 49407)
+        let short = clip.encodeWithMask("a b")
+        #expect(text.tokenize("a b").ids == Array(short.ids.prefix(Int(short.attentionMask.reduce(0, +)))))
+        #expect(inputs["attention_mask"]?.ints?.prefix(77).reduce(0, +) == 77)
+
+        var gemma = try FakeModels.model("embeddinggemma-2") { _, _, _, _ in [3, 4] + [Float](repeating: 0, count: 766)
+        }
+        let cut = try await gemma.embed(texts: [Array(repeating: "w", count: 3000).joined(separator: " ")])[0]
+        #expect(cut.status == .truncated(tokens: 3002, limit: 2048))
+        #expect(try gemma.truncate(cut, to: 128).status == cut.status)
+        #expect(try cut.cosine(Embedding(vector: cut.vector, space: cut.space)) > 0.9999)
     }
 
     @Test func defaultPromptIsPrepended() throws {
         let block = try Fixtures.block("embeddinggemma-2") { $0.edit("text") { $0["default_prompt_name"] = "query" } }
         #expect(block.text.prompt == "task: search result | query: ")
         let text = FakeModels.text(block.text)
-        #expect(text.tokenize("cats") == text.encode("task: search result | query: cats").map(Int32.init))
+        #expect(text.tokenize("cats").ids == text.encode("task: search result | query: cats").map(Int32.init))
     }
 
     @Test func missingTowerAndNonFiniteOutput() async throws {
-        let text = try FakeModels.model("clip-vit-b32-text")
+        var text = try FakeModels.model("clip-vit-b32-text")
         let image = try Fixtures.image(width: 8, height: 8) { _, _ in (0, 0, 0) }
         let error = await #expect(throws: EmbeddingError.self) { try await text.embed(images: [image]) }
         #expect(error?.description == "the bundle has no image tower")
-        let broken = try FakeModels.model("clip-vit-b32") { _, _, _, _ in [.nan] }
+        var broken = try FakeModels.model("clip-vit-b32") { _, _, _, _ in [.nan] }
         await #expect(throws: EmbeddingError.self) { try await broken.embed(texts: ["a"]) }
+    }
+}
+
+@Suite struct SharedEmbeddingModelTests {
+    @Test func servesCallersOneAtATimeInOrder() async throws {
+        let log = CallLog()
+        let shared = try SharedEmbeddingModel(
+            FakeModels.model("clip-vit-b32", log: log) { _, _, b, inputs in
+                [Float(inputs["input_ids"]!.ints![b * 77 + 1])] + [Float](repeating: 0, count: 511)
+            })
+        await log.hold()
+        var calls: [Task<[Embedding], Error>] = []
+        for words in 1...4 {
+            calls.append(Task { try await shared.embed(texts: [String(repeating: "x", count: words)]) })
+            // The first call runs and is held; each later one waits behind the ones before it.
+            while await log.calls.isEmpty || shared.waitingCount < words - 1 { await Task.yield() }
+        }
+        await log.release()
+        for (words, call) in calls.enumerated() {
+            #expect(try await call.value.map { $0.vector[0] } == [Float(words + 11)])
+        }
+        #expect(await log.calls.map { $0.inputs["input_ids"]!.ints![1] } == [11, 12, 13, 14])
+        #expect(await log.mostRunning == 1)
+
+        // A call that throws puts the model back.
+        await #expect(throws: EmbeddingError.self) { try await shared.embed(["a"], dimensions: 100) }
+        #expect(try await shared.embed(["a"]).count == 1)
     }
 }

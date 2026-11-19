@@ -64,6 +64,6 @@ uv run coreai.embedding.export --help
 
 ### In your iOS and macOS applications
 
-`CoreAIEmbeddings` runs the text tower: `EmbeddingModel(resourcesAt:)`, then `embed(texts:)`. It does not run the audio tower yet: a full bundle loads, and `modalities` is `[.text]`.
+`CoreAIEmbeddings` runs the text tower: `CoreAIEmbeddingModel(resourcesAt:)`, then `embed(texts:)`; texts are cut at 77 tokens. It does not run the audio tower yet: a full bundle loads, and `modalities` is `[.text]`.
 
 [^1]: [Paper](https://arxiv.org/abs/2211.06687) · [HuggingFace](https://huggingface.co/laion/clap-htsat-unfused)

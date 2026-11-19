@@ -81,11 +81,33 @@ struct FakeCall: Sendable {
     let inputs: [String: HostTensor]
 }
 
-/// Records the calls of every fake program of a model.
+/// Records the calls of every fake program of a model, and holds them while `hold()` is in effect.
 actor CallLog {
     private(set) var calls: [FakeCall] = []
-    func append(_ call: FakeCall) { calls.append(call) }
+    /// The most calls running at once.
+    private(set) var mostRunning = 0
+    private var running = 0
+    private var held: [CheckedContinuation<Void, Never>]?
+
     func calls(of component: String) -> [FakeCall] { calls.filter { $0.component == component } }
+
+    /// Makes later calls wait in `begin` until `release()`.
+    func hold() { held = held ?? [] }
+
+    func release() {
+        let waiting = held ?? []
+        held = nil
+        for call in waiting { call.resume() }
+    }
+
+    func begin(_ call: FakeCall) async {
+        calls.append(call)
+        running += 1
+        mostRunning = max(mostRunning, running)
+        if held != nil { await withCheckedContinuation { held?.append($0) } }
+    }
+
+    func end() { running -= 1 }
 }
 
 /// A program of one asset that answers every function with outputs of the declared shapes. Each
@@ -101,7 +123,7 @@ struct FakeProgram: Program {
             block.components.first {
                 $0.value.asset == asset && $0.value.functions.contains { $0.function == function }
             })
-        await log.append(FakeCall(component: component, function: function, inputs: inputs))
+        await log.begin(FakeCall(component: component, function: function, inputs: inputs))
         let batch = inputs.values.first?.shape.first ?? 1
         let length = inputs.values.lazy.compactMap { tensor -> Int? in tensor.shape.count > 1 ? tensor.shape[1] : nil }
             .first
@@ -124,6 +146,7 @@ struct FakeProgram: Program {
             }
             outputs[name] = HostTensor(float32: values, shape: [batch] + rowShape)
         }
+        await log.end()
         return outputs
     }
 }
@@ -145,14 +168,31 @@ enum FakeModels {
     }
 
     static func model(
-        _ name: String, log: CallLog = CallLog(),
+        _ name: String, log: CallLog = CallLog(), text: TextPreparer? = nil,
         value: @escaping @Sendable (String, String, Int, [String: HostTensor]) -> [Float]? = { _, _, _, _ in nil }
-    ) throws -> EmbeddingModel {
+    ) throws -> CoreAIEmbeddingModel {
         let bundle = try bundle(name)
-        return try EmbeddingModel(
+        let text = text ?? Self.text(bundle.block.text)
+        return try CoreAIEmbeddingModel(
             bundle: bundle,
             programs: { _, component in FakeProgram(asset: component.asset, block: bundle.block, log: log, value: value)
             },
-            text: { text(bundle.block.text) })
+            text: { text })
+    }
+
+    /// The one-letter words `a`-`z`, as a CLIP vocabulary.
+    static let clipVocab = Dictionary(
+        uniqueKeysWithValues: (0..<26).map { ("\(UnicodeScalar(97 + $0)!)</w>", Int32(320 + $0)) })
+
+    /// A `CLIPTokenizer` preparer for `config` over `clipVocab`.
+    static func clipText(_ config: TextConfig) async throws -> TextPreparer {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "clip-tokenizer-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try JSONSerialization.data(withJSONObject: ["model": ["vocab": clipVocab, "merges": [[String]]()]])
+            .write(to: folder.appending(path: "tokenizer.json"))
+        try JSONSerialization.data(withJSONObject: ["tokenizer_class": "CLIPTokenizer"])
+            .write(to: folder.appending(path: "tokenizer_config.json"))
+        return try await TextPreparer.load(from: folder, config: config)
     }
 }

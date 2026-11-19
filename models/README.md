@@ -267,7 +267,7 @@ Each export writes a bundle directory `exports/<name>/` with:
 
 Every tower returns L2-normalized vectors in one shared space: the cosine of a
 text vector and an image or audio vector is their similarity. In Swift,
-[`CoreAIEmbeddings`](../swift/Sources/CoreAIEmbeddings/README.md) runs the text and image towers (CLIP, EmbeddingGemma 2, CLAP text-only).
+[`CoreAIEmbeddings`](../swift/Sources/CoreAIEmbeddings/README.md) runs the text and image towers (CLIP, EmbeddingGemma 2, Qwen3-Embedding, CLAP text-only).
 
 - `--text-only` exports the text tower alone.
 - `--compute-precision` picks the compute precision; `--list-models` shows each model's options.

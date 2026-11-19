@@ -56,9 +56,7 @@ import Testing
     static func driver(_ name: String, _ modality: EmbeddingModality) throws -> PipelineDriver {
         let bundle = try FakeModels.bundle(name)
         let tower = try #require(bundle.block.tower(for: modality))
-        return try PipelineDriver(
-            tower: tower, block: bundle.block,
-            programs: ProgramCache(bundle: bundle.bundle, factory: ProgramCache.coreAI))
+        return try PipelineDriver(tower: tower, block: bundle.block)
     }
 
     @Test(arguments: Fixtures.names)
@@ -86,7 +84,6 @@ import Testing
     }
 
     @Test func refusesAnInputNothingProvides() throws {
-        let programs = ProgramCache(bundle: try FakeModels.bundle("clip-vit-b32").bundle, factory: ProgramCache.coreAI)
         let text = try Fixtures.block("clip-vit-b32") {
             $0.edit("components.text_encoder") {
                 $0["inputs"] = [
@@ -95,14 +92,14 @@ import Testing
             }
         }
         let error = #expect(throws: EmbeddingError.self) {
-            try PipelineDriver(tower: text.tower(for: .text)!, block: text, programs: programs)
+            try PipelineDriver(tower: text.tower(for: .text)!, block: text)
         }
         #expect(error?.description.contains("token_type_ids") == true)
         let image = try Fixtures.block("clip-vit-b32") {
             $0.edit("components.image_encoder") { $0["inputs"] = ["pixel_values": "float32[B,196,768]"] }
         }
         #expect(throws: EmbeddingError.self) {
-            try PipelineDriver(tower: image.tower(for: .image)!, block: image, programs: programs)
+            try PipelineDriver(tower: image.tower(for: .image)!, block: image)
         }
     }
 

@@ -157,14 +157,13 @@ actor CoreAIProgram: Program {
 }
 
 /// One `Program` per asset and compute unit, shared by the components that name it.
-actor ProgramCache {
+struct ProgramCache: Sendable {
     /// Makes and loads the program of a component's asset.
     typealias Factory = @Sendable (_ url: URL, _ component: Component) async throws -> any Program
 
     private let bundle: ModelBundle
     private let factory: Factory
-    /// Loads in flight or done, so concurrent first calls share one load.
-    private var programs: [String: Task<any Program, Error>] = [:]
+    private var programs: [String: any Program] = [:]
 
     init(bundle: ModelBundle, factory: @escaping Factory) {
         self.bundle = bundle
@@ -172,22 +171,13 @@ actor ProgramCache {
     }
 
     /// The program of `component`, loading its asset on first use.
-    func program(for component: Component) async throws -> any Program {
+    mutating func program(for component: Component) async throws -> any Program {
         let key = component.asset + "/" + component.computeUnits[0].rawValue
-        if let load = programs[key] { return try await load.value }
-        let url = try bundle.requireModelURL(for: component.asset)
-        let load = Task { [factory] in try await factory(url, component) }
-        programs[key] = load
-        do {
-            return try await load.value
-        } catch {
-            if programs[key] == load { programs[key] = nil }
-            throw error
-        }
+        if let program = programs[key] { return program }
+        let program = try await factory(bundle.requireModelURL(for: component.asset), component)
+        programs[key] = program
+        return program
     }
-
-    /// Drops every program.
-    func removeAll() { programs.removeAll() }
 
     /// A factory of loaded `CoreAIProgram`s on the component's first compute unit.
     static let coreAI: Factory = { url, component in

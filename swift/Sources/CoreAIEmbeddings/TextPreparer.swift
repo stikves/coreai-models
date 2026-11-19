@@ -26,8 +26,7 @@ struct TextPreparer: Sendable {
         if try tokenizerClass(in: folder)?.hasPrefix("CLIPTokenizer") == true {
             let clip = try CLIPTokenizer(folder: folder)
             return TextPreparer(config: config) { text in
-                let (ids, mask) = clip.encodeWithMask(text, contextLength: config.maxTokens)
-                return ids.prefix(Int(mask.reduce(0, +))).map(Int.init)
+                clip.encodeUntruncated(text).map(Int.init)
             }
         }
         let tokenizer = try await AutoTokenizer.from(modelFolder: folder)
@@ -42,13 +41,15 @@ struct TextPreparer: Sendable {
         return json?["tokenizer_class"] as? String
     }
 
-    /// Token ids of the default prompt plus `text`, truncated to `maxTokens` with EOS kept last.
-    func tokenize(_ text: String) -> [Int32] {
+    /// Token ids of the default prompt plus `text`, truncated to `maxTokens` with EOS kept last,
+    /// and the token count before truncation.
+    func tokenize(_ text: String) -> (ids: [Int32], count: Int) {
         var ids = encode(config.prompt + text).map(Int32.init)
-        if ids.count > config.maxTokens {
-            ids.removeLast(ids.count - config.maxTokens)
+        let count = ids.count
+        if count > config.maxTokens {
+            ids.removeLast(count - config.maxTokens)
             if config.keepEos && config.addEosToken { ids[ids.count - 1] = config.eosTokenId }
         }
-        return ids
+        return (ids, count)
     }
 }

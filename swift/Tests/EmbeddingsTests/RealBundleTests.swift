@@ -36,11 +36,11 @@ struct RealBundleTests {
         ]
     }
 
-    static func model(_ name: String) async throws -> EmbeddingModel? {
+    static func model(_ name: String) async throws -> CoreAIEmbeddingModel? {
         guard let url = root?.appending(path: name), FileManager.default.fileExists(atPath: url.path) else {
             return nil
         }
-        return try await EmbeddingModel(resourcesAt: url)
+        return try await CoreAIEmbeddingModel(resourcesAt: url)
     }
 
     /// Each caption scores its own image highest; text-only bundles embed each caption differently.
@@ -49,7 +49,7 @@ struct RealBundleTests {
         "clap-htsat-text", "embeddinggemma-2", "embeddinggemma-2-ios", "qwen3-embedding-0.6b",
     ])
     func captionsMatchImages(_ name: String) async throws {
-        guard let model = try await Self.model(name) else { return }
+        guard var model = try await Self.model(name) else { return }
         let texts = try await model.embed(texts: Self.captions)
         guard model.modalities.contains(.image) else {
             for (i, j) in [(0, 1), (0, 2), (1, 2)] {
@@ -66,8 +66,8 @@ struct RealBundleTests {
     }
 
     @Test func gpuAndNeuralEngineBundlesAgree() async throws {
-        guard let gpu = try await Self.model("embeddinggemma-2"),
-            let neuralEngine = try await Self.model("embeddinggemma-2-ios")
+        guard var gpu = try await Self.model("embeddinggemma-2"),
+            var neuralEngine = try await Self.model("embeddinggemma-2-ios")
         else { return }
         let images = try Self.images()
         let a = try await gpu.embed(texts: Self.captions) + gpu.embed(images: images)

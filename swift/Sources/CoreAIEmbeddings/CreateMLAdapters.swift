@@ -11,17 +11,18 @@ import Foundation
 
 // A bundle's towers as CreateMLComponents transformers, e.g.
 // `CoreAIEmbeddingImageExtractor(model:).appending(LogisticRegressionClassifier())` where
-// `ImageFeaturePrint()` would go.
+// `ImageFeaturePrint()` would go. The extractors take a `SharedEmbeddingModel`, so a text and an
+// image extractor can share one loaded model.
 
 /// `String` -> `MLShapedArray<Float>` of shape `[dimensions]`. Reports each input to `eventHandler` as one
 /// item.
 public struct CoreAIEmbeddingTextExtractor: CreateMLComponents.Transformer, Sendable {
-    public let model: EmbeddingModel
+    public let model: SharedEmbeddingModel
     /// One of `model.matryoshkaDimensions`; the native width when `nil`.
     public let dimensions: Int?
 
     /// - Throws: `EmbeddingError.unsupportedDimension`.
-    public init(model: EmbeddingModel, dimensions: Int? = nil) throws {
+    public init(model: SharedEmbeddingModel, dimensions: Int? = nil) throws {
         try model.check(dimensions: dimensions)
         self.model = model
         self.dimensions = dimensions
@@ -37,14 +38,14 @@ public struct CoreAIEmbeddingTextExtractor: CreateMLComponents.Transformer, Send
 /// `CIImage` -> `MLShapedArray<Float>` of shape `[dimensions]`. An `ImageFeatureExtractor`, so it
 /// fits wherever `ImageFeaturePrint` does. Reports each input to `eventHandler` as one item.
 public struct CoreAIEmbeddingImageExtractor: ImageFeatureExtractor, @unchecked Sendable {
-    public let model: EmbeddingModel
+    public let model: SharedEmbeddingModel
     /// One of `model.matryoshkaDimensions`; the native width when `nil`.
     public let dimensions: Int?
     private let context: CIContext
 
     /// - Throws: `EmbeddingError.modalityNotInBundle` for a bundle without an image tower,
     ///   `.unsupportedDimension`.
-    public init(model: EmbeddingModel, dimensions: Int? = nil, context: CIContext = CIContext()) throws {
+    public init(model: SharedEmbeddingModel, dimensions: Int? = nil, context: CIContext = CIContext()) throws {
         guard model.modalities.contains(.image) else { throw EmbeddingError.modalityNotInBundle(.image) }
         try model.check(dimensions: dimensions)
         self.model = model

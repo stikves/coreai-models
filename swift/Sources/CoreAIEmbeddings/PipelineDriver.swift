@@ -52,12 +52,11 @@ struct PipelineDriver: Sendable {
     let seed: Seed
     let stages: [Stage]
     let block: EmbeddingBlock
-    let programs: ProgramCache
 
     /// Plans `tower`: picks the seed from the first stage's inputs and a source for every stage input.
     ///
     /// - Throws: `EmbeddingError.unsupportedPipeline` naming the first input nothing provides.
-    init(tower: Tower, block: EmbeddingBlock, programs: ProgramCache) throws {
+    init(tower: Tower, block: EmbeddingBlock) throws {
         let first = try Self.component(tower.pipeline.first ?? "", block)
         let pixels = first.inputs["pixel_values"]
         let seed: Seed
@@ -99,7 +98,6 @@ struct PipelineDriver: Sendable {
         self.seed = seed
         self.stages = stages
         self.block = block
-        self.programs = programs
     }
 
     private static func component(_ name: String, _ block: EmbeddingBlock) throws -> Component {
@@ -196,9 +194,9 @@ struct PipelineDriver: Sendable {
         return groups
     }
 
-    /// Runs the stages over `rows` and returns each row's `embedding`. Checks for cancellation before
-    /// each program call.
-    func run(_ rows: [Row]) async throws -> [[Float]] {
+    /// Runs the stages over `rows` with programs from `programs` and returns each row's `embedding`.
+    /// Checks for cancellation before each program call.
+    func run(_ rows: [Row], programs: inout ProgramCache) async throws -> [[Float]] {
         var rows = rows
         for stage in stages {
             let program = try await programs.program(for: stage.component)
