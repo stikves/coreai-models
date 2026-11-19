@@ -232,7 +232,7 @@ final class ServerState: @unchecked Sendable {
     /// let engine = state.engineForRequest(lane: lane)
     /// ```
     func acquireAccess(lane: BatchServingLane) async throws -> RequestAccess {
-        let permit = needsServerPermit(lane: lane) ? try await queue.acquire() : nil
+        let permit = needsServerPermit(lane: lane) ? try await queuePermit() : nil
         let lease = lane == .fallbackBatchOne ? await batchScheduler?.acquireExclusiveAccess() : nil
         return try admittedForMemory(RequestAccess(permit: permit, lease: lease))
     }
@@ -244,7 +244,16 @@ final class ServerState: @unchecked Sendable {
     /// Throws `ServerError.queueFull` when the queue is full, `CancellationError` when the task
     /// is cancelled while waiting, and ``MemoryRefusal`` as ``acquireAccess(lane:)`` does.
     func acquireScoringAccess() async throws -> RequestAccess {
-        try admittedForMemory(RequestAccess(permit: try await queue.acquire(), lease: nil))
+        try admittedForMemory(RequestAccess(permit: try await queuePermit(), lease: nil))
+    }
+
+    /// The single-slot permit from `queue`; a full queue throws `ServerError.queueFull`.
+    private func queuePermit() async throws -> QueuePermit {
+        do {
+            return try await queue.acquire()
+        } catch RequestQueueError.full(let depth) {
+            throw ServerError.queueFull(depth: depth)
+        }
     }
 
     /// `access`, unless the process is past the device's memory recommendation: then releases it and

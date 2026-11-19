@@ -45,7 +45,7 @@ public final class RequestQueue: Sendable {
     }
 
     /// Acquire the exclusive slot, waiting in FIFO order if it is held. Throws
-    /// `ServerError.queueFull` when `maxDepth` waiters are already queued, or
+    /// `RequestQueueError.full` when `maxDepth` waiters are already queued, or
     /// `CancellationError` if the awaiting task is cancelled while queued.
     public func acquire() async throws -> QueuePermit {
         let needsWait: Bool = state.withLock { s in
@@ -83,7 +83,7 @@ public final class RequestQueue: Sendable {
                 case .acquired:
                     cont.resume()
                 case .rejected:
-                    cont.resume(throwing: ServerError.queueFull(depth: maxDepth))
+                    cont.resume(throwing: RequestQueueError.full(depth: maxDepth))
                 case .cancelled:
                     cont.resume(throwing: CancellationError())
                 case .queued:
@@ -143,21 +143,15 @@ public final class QueuePermit: Sendable {
     deinit { release() }
 }
 
-// MARK: - Server Errors
+// MARK: - Request Queue Errors
 
-public enum ServerError: Error, LocalizedError {
-    case badRequest(String)
-    case queueFull(depth: Int)
-
-    public var isBadRequest: Bool {
-        if case .badRequest = self { return true }
-        return false
-    }
+public enum RequestQueueError: Error, LocalizedError {
+    /// `depth` requests were already waiting.
+    case full(depth: Int)
 
     public var errorDescription: String? {
         switch self {
-        case .badRequest(let msg): return msg
-        case .queueFull(let depth): return "Queue full (depth: \(depth))"
+        case .full(let depth): return "Queue full (depth: \(depth))"
         }
     }
 }

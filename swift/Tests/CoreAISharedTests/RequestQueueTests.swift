@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-import CoreAILMCommon
+import CoreAIShared
 import Testing
 
 /// Unit tests for the async `RequestQueue` semaphore that replaced the binary
@@ -101,7 +101,7 @@ struct RequestQueueTests {
         #expect(queue.isActive == false)
     }
 
-    @Test("acquire rejects with queueFull once the queue reaches maxDepth")
+    @Test("acquire rejects with full once the queue reaches maxDepth")
     func rejectsAtMaxDepth() async throws {
         let queue = RequestQueue(maxDepth: 2)
         let permit0 = try await queue.acquire()  // active slot
@@ -114,12 +114,8 @@ struct RequestQueueTests {
         // Queue is now at maxDepth (2 waiters); the next acquire must reject.
         do {
             _ = try await queue.acquire()
-            Issue.record("expected queueFull to be thrown")
-        } catch let error as ServerError {
-            guard case .queueFull(let depth) = error else {
-                Issue.record("expected .queueFull, got \(error)")
-                return
-            }
+            Issue.record("expected full to be thrown")
+        } catch RequestQueueError.full(let depth) {
             #expect(depth == 2)
         }
 
@@ -137,7 +133,7 @@ struct RequestQueueTests {
         let queue = RequestQueue(maxDepth: 0)
         let permit0 = try await queue.acquire()  // active slot, no queuing allowed
 
-        await #expect(throws: ServerError.self) {
+        await #expect(throws: RequestQueueError.self) {
             _ = try await queue.acquire()
         }
         #expect(queue.queuedCount == 0)
@@ -154,7 +150,7 @@ struct RequestQueueTests {
         #expect(queue.maxDepth == 0)
 
         let permit0 = try await queue.acquire()
-        await #expect(throws: ServerError.self) {
+        await #expect(throws: RequestQueueError.self) {
             _ = try await queue.acquire()
         }
         permit0.release()
