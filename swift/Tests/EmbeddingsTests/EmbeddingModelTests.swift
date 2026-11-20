@@ -99,6 +99,9 @@ import Testing
             Issue.record("truncate threw \(String(describing: truncated)), not incompatibleEmbeddings")
             return
         }
+        let shared = SharedEmbeddingModel(model)
+        #expect(try shared.truncate(full, to: 128) == small)
+        #expect(throws: EmbeddingError.self) { try shared.truncate(full, to: 100) }
     }
 
     @Test func mixedInputsKeepTheirOrder() async throws {

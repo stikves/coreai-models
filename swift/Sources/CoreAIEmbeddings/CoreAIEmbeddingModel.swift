@@ -32,7 +32,7 @@ public struct CoreAIEmbeddingModel: EmbeddingModel, ~Copyable, Sendable {
     /// `logits = logitScale * cosine`, for models trained with one (CLIP).
     public let logitScale: Double?
     /// Whether a vector cut to a smaller width is L2-normalized again.
-    public let renormalizesAfterTruncation: Bool
+    let renormalizesAfterTruncation: Bool
 
     private let drivers: [EmbeddingModality: PipelineDriver]
     private var programs: ProgramCache
@@ -122,6 +122,16 @@ public struct CoreAIEmbeddingModel: EmbeddingModel, ~Copyable, Sendable {
         try await InstrumentsProfiler.profile(InstrumentsProfiler.beginEmbed(inputs: inputs.count)) {
             try await run(inputs, dimensions: dimensions)
         }
+    }
+
+    /// `embedding` cut to `width` leading values, L2-normalized again when the bundle says so: the
+    /// vector `embed` returns at that width, without running the model. The status stays.
+    ///
+    /// - Throws: `EmbeddingError.unsupportedDimension` unless `width` is one of
+    ///   `matryoshkaDimensions` and at most `embedding.dimension`; `.incompatibleEmbeddings` for an
+    ///   embedding of another space.
+    public func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding {
+        try checkedCut(embedding, to: width, renormalize: renormalizesAfterTruncation)
     }
 
     // MARK: - Private

@@ -26,13 +26,19 @@ public protocol EmbeddingModel: ~Copyable {
     var modalities: Set<EmbeddingModality> { get }
     /// `logits = logitScale * cosine`, for models trained with one (CLIP).
     var logitScale: Double? { get }
-    /// Whether a vector cut to a smaller width is L2-normalized again.
-    var renormalizesAfterTruncation: Bool { get }
 
     /// Embeds `inputs`, texts and images in any mix, and returns one vector per input in order.
     ///
     /// - Parameter dimensions: one of `matryoshkaDimensions`; the native width when `nil`.
     mutating func embed(_ inputs: [EmbeddingInput], dimensions: Int?) async throws -> [Embedding]
+
+    /// `embedding` cut to `width` leading values, L2-normalized again when the bundle says so: the
+    /// vector `embed` returns at that width, without running the model. The status stays.
+    ///
+    /// - Throws: `EmbeddingError.unsupportedDimension` unless `width` is one of
+    ///   `matryoshkaDimensions` and at most `embedding.dimension`; `.incompatibleEmbeddings` for an
+    ///   embedding of another space.
+    func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding
 }
 
 extension EmbeddingModel where Self: ~Copyable {
@@ -51,13 +57,9 @@ extension EmbeddingModel where Self: ~Copyable {
         try await embed(images.map { .image($0) }, dimensions: dimensions)
     }
 
-    /// `embedding` cut to `width` leading values, L2-normalized again when the bundle says so: the
-    /// vector `embed` returns at that width, without running the model. The status stays.
-    ///
-    /// - Throws: `EmbeddingError.unsupportedDimension` unless `width` is one of
-    ///   `matryoshkaDimensions` and at most `embedding.dimension`; `.incompatibleEmbeddings` for an
-    ///   embedding of another space.
-    public func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding {
+    /// The body of `truncate(_:to:)`: checks `embedding` and `width`, then cuts, L2-normalizing
+    /// again when `renormalize` is set.
+    func checkedCut(_ embedding: Embedding, to width: Int, renormalize: Bool) throws -> Embedding {
         guard embedding.space == space else {
             throw EmbeddingError.incompatibleEmbeddings("the embedding is from \(embedding.space.id), not \(space.id)")
         }
@@ -65,7 +67,7 @@ extension EmbeddingModel where Self: ~Copyable {
             throw EmbeddingError.unsupportedDimension(
                 width, supported: matryoshkaDimensions.filter { $0 <= embedding.dimension })
         }
-        return embedding.cut(to: width, renormalize: renormalizesAfterTruncation)
+        return embedding.cut(to: width, renormalize: renormalize)
     }
 
     /// Throws `unsupportedDimension` unless `dimensions` is `nil` or one of `matryoshkaDimensions`.

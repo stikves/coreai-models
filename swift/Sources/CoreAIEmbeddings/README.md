@@ -37,15 +37,14 @@ public protocol EmbeddingModel: ~Copyable {
     var matryoshkaDimensions: [Int] { get }
     var modalities: Set<EmbeddingModality> { get }
     var logitScale: Double? { get }
-    var renormalizesAfterTruncation: Bool { get }
     mutating func embed(_ inputs: [EmbeddingInput], dimensions: Int?) async throws -> [Embedding]
+    func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding
 }
 
 extension EmbeddingModel where Self: ~Copyable {
     mutating func embed(_ inputs: [EmbeddingInput]) async throws -> [Embedding]
     mutating func embed(texts: [String], dimensions: Int? = nil) async throws -> [Embedding]
     mutating func embed(images: [CGImage], dimensions: Int? = nil) async throws -> [Embedding]
-    func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding
 }
 
 public struct CoreAIEmbeddingModel: EmbeddingModel, ~Copyable, Sendable {
@@ -53,6 +52,7 @@ public struct CoreAIEmbeddingModel: EmbeddingModel, ~Copyable, Sendable {
     mutating func embed(_ inputs: [EmbeddingInput], dimensions: Int? = nil) async throws -> [Embedding]
     mutating func load(_ modalities: Set<EmbeddingModality>? = nil) async throws
     mutating func warmup(_ modalities: Set<EmbeddingModality>? = nil) async throws
+    func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding
 }
 
 public final class SharedEmbeddingModel: EmbeddingModel, Sendable {
@@ -62,6 +62,7 @@ public final class SharedEmbeddingModel: EmbeddingModel, Sendable {
     func embed(images: [CGImage], dimensions: Int? = nil) async throws -> [Embedding]
     func load(_ modalities: Set<EmbeddingModality>? = nil) async throws
     func warmup(_ modalities: Set<EmbeddingModality>? = nil) async throws
+    func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding
 }
 ```
 

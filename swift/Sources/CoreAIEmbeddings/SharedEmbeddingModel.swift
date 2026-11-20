@@ -29,7 +29,7 @@ public final class SharedEmbeddingModel: EmbeddingModel, Sendable {
     /// `logits = logitScale * cosine`, for models trained with one (CLIP).
     public let logitScale: Double?
     /// Whether a vector cut to a smaller width is L2-normalized again.
-    public let renormalizesAfterTruncation: Bool
+    let renormalizesAfterTruncation: Bool
 
     /// The model between calls; `nil` while a call has it.
     private let model: Mutex<CoreAIEmbeddingModel?>
@@ -61,6 +61,11 @@ public final class SharedEmbeddingModel: EmbeddingModel, Sendable {
     /// Embeds `images`.
     public func embed(images: [CGImage], dimensions: Int? = nil) async throws -> [Embedding] {
         try await embed(images.map { .image($0) }, dimensions: dimensions)
+    }
+
+    /// `CoreAIEmbeddingModel.truncate(_:to:)`. Runs no model, so it does not wait for other calls.
+    public func truncate(_ embedding: Embedding, to width: Int) throws -> Embedding {
+        try checkedCut(embedding, to: width, renormalize: renormalizesAfterTruncation)
     }
 
     /// `CoreAIEmbeddingModel.load(_:)`, after the calls before it.
