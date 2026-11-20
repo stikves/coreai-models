@@ -327,6 +327,9 @@ let package = Package(
             ],
             path: "swift/Tests/LanguageModelsTests",
             resources: [
+                .copy("Resources/ByteLevelEmojiTokenizer"),
+                .copy("Resources/GraphemeByteFallbackTokenizer"),
+                .copy("Resources/MetaspaceByteFallbackTokenizer"),
                 .copy("Resources/MinimalTokenizer"),
                 .copy("Resources/QwenSplitTokenizer"),
             ],

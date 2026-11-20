@@ -151,7 +151,9 @@ public struct CoreAILanguageModel: LanguageModel {
             resources: resources, maxWhitespaceCount: maxWhitespaceCount)
     }
 
-    private init(
+    /// Creates a model from a tokenizer and the resources that hold its engine. Register `resources`
+    /// for `configuration` (``ModelResources/register(_:for:)``) so the executor uses them too.
+    init(
         configuration: CoreAIExecutor.Configuration,
         bundle: LanguageModelBundle,
         tokenizer: any Tokenizer,

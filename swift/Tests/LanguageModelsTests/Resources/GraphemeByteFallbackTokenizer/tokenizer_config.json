@@ -1,0 +1,8 @@
+{
+ "tokenizer_class": "GemmaTokenizer",
+ "clean_up_tokenization_spaces": false,
+ "bos_token": "<bos>",
+ "eos_token": "<eos>",
+ "unk_token": "<unk>",
+ "pad_token": "<pad>"
+}

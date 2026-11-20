@@ -75,6 +75,11 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
             additionalStopTokenIds: additionalStopTokenIds
         )
     }
+
+    /// Creates a model over an engine and tokenizer the caller has built.
+    init(executorConfiguration: CoreAIVLMExecutor.Configuration) {
+        self.executorConfiguration = executorConfiguration
+    }
 }
 
 // MARK: - CoreAIVLMExecutor

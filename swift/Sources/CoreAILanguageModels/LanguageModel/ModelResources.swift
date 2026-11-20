@@ -145,6 +145,15 @@ final class ModelResources: ResourceManaging {
         }
     }
 
+    /// Makes `resources` the shared instance for `configuration`, so that a model built with it and
+    /// the executors FoundationModels makes for that model use the same engine. For tests that drive
+    /// a session with a scripted engine.
+    static func register(
+        _ resources: ModelResources, for configuration: CoreAILanguageModel.CoreAIExecutor.Configuration
+    ) {
+        registry.withLock { $0[configuration] = WeakBox(resources) }
+    }
+
     private static func loadEngine(
         _ configuration: CoreAILanguageModel.CoreAIExecutor.Configuration
     ) async throws -> any InferenceEngine {

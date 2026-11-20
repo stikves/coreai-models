@@ -1,0 +1,10 @@
+{
+ "tokenizer_class": "TokenizersBackend",
+ "clean_up_tokenization_spaces": false,
+ "add_prefix_space": true,
+ "legacy": false,
+ "bos_token": "<s>",
+ "eos_token": "</s>",
+ "unk_token": "<unk>",
+ "pad_token": null
+}
