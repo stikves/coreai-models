@@ -239,6 +239,13 @@ class MockEngine: InferenceEngine, @unchecked Sendable {
         }
     }
 
+    /// How many times `waitUntilIdle()` was called.
+    let waitUntilIdleCalls = Mutex(0)
+
+    func waitUntilIdle() async {
+        waitUntilIdleCalls.withLock { $0 += 1 }
+    }
+
     func reset(to tokenIndex: Int) async throws {
         try await cancel()
         resetCalled = true

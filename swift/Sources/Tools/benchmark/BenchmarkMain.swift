@@ -283,8 +283,6 @@ struct LLMBenchmark: AsyncParsableCommand {
         sampling: SamplingConfiguration,
         maxTokens: Int? = nil
     ) async throws -> TrialResult {
-        // Brief pause for engine to finish prior async work before reset
-        try? await Task.sleep(for: .milliseconds(50))
         try await engine.reset()
 
         let options = InferenceOptions.extend(maxTokens: maxTokens ?? generationTokens)
@@ -307,6 +305,9 @@ struct LLMBenchmark: AsyncParsableCommand {
         }
 
         let genTime = seconds(from: genStart, to: .now)
+        // Outside the timing: the engine puts its state back after the last token, before the next
+        // trial's reset() or the process exit.
+        await engine.waitUntilIdle()
         let promptTps = promptTime > 0 ? Double(prompt.count) / promptTime : 0
         let decodeCount = max(0, count - 1)
         let genTps = genTime > 0 ? Double(decodeCount) / genTime : 0

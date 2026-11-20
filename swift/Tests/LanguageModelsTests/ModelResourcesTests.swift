@@ -167,4 +167,51 @@ struct ModelResourcesTests {
         try await borrow
         #expect(resources.isLoaded == false)
     }
+
+    @Test("A borrow ends only after the engine is idle")
+    func borrowWaitsForIdleEngine() async throws {
+        let engine = MockEngine()
+        let resources = ModelResources { engine }
+
+        let callsInsideBody = try await resources.withEngine { _ in
+            engine.waitUntilIdleCalls.withLock { $0 }
+        }
+
+        #expect(callsInsideBody == 0)
+        #expect(engine.waitUntilIdleCalls.withLock { $0 } == 1)
+    }
+
+    @Test("A borrow whose body throws still waits for the engine to be idle")
+    func throwingBorrowWaitsForIdleEngine() async throws {
+        let engine = MockEngine()
+        let resources = ModelResources { engine }
+
+        await #expect(throws: LoadFailure.self) {
+            try await resources.withEngine { _ -> Void in throw LoadFailure() }
+        }
+
+        #expect(engine.waitUntilIdleCalls.withLock { $0 } == 1)
+    }
+
+    @Test("Only the last of overlapping borrows waits for the engine")
+    func onlyLastBorrowWaitsForIdleEngine() async throws {
+        let engine = MockEngine()
+        let resources = ModelResources { engine }
+        let inside = Mutex(false)
+        let release = Mutex(false)
+
+        async let outer: Void = resources.withEngine { _ in
+            inside.withLock { $0 = true }
+            while !release.withLock({ $0 }) { await Task.yield() }
+        }
+        while !inside.withLock({ $0 }) { await Task.yield() }
+
+        // The engine is still the outer borrow's: the inner one leaves without waiting.
+        try await resources.withEngine { _ in }
+        #expect(engine.waitUntilIdleCalls.withLock { $0 } == 0)
+
+        release.withLock { $0 = true }
+        try await outer
+        #expect(engine.waitUntilIdleCalls.withLock { $0 } == 1)
+    }
 }

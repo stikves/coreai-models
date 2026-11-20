@@ -418,6 +418,13 @@ final class CoreAIPipelinedEngine: InferenceEngine, ConstrainedGenerationCapable
         await task?.value
     }
 
+    /// Waits for the generation task in flight now, without cancelling it. A reader that stopped early
+    /// has already ended the token stream, so `runCompletion` stops at its next step and the task
+    /// returns on its own. A generation started after this call is not waited for.
+    func waitUntilIdle() async {
+        await _generationTask.withLock({ $0 })?.value
+    }
+
     func reset(to tokenIndex: Int) async throws {
         precondition(
             tokenIndex >= 0 && tokenIndex <= processedTokenCount,

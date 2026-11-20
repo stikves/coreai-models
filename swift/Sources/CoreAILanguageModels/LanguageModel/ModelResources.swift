@@ -77,6 +77,11 @@ final class ModelResources: ResourceManaging {
     /// Borrows the engine for the duration of `body`, counting it as an active
     /// use. A concurrent `unloadResources()` defers its teardown until the last
     /// borrow returns, so the engine is never freed mid-generation.
+    ///
+    /// The last borrow ends only once the engine is idle: `body` may stop reading
+    /// a generation early (EOS, a stop sequence), and a pipelined engine is still
+    /// draining that generation when `body` returns. With other borrows active the
+    /// engine is theirs now, and their next `generate()` waits for this one.
     func withEngine<T>(
         _ body: (any InferenceEngine) async throws -> T
     ) async throws -> T {
@@ -91,7 +96,19 @@ final class ModelResources: ResourceManaging {
             }
             if shouldTeardown { teardown() }
         }
-        return try await body(engine)
+        do {
+            let result = try await body(engine)
+            await waitUntilIdleIfLastBorrow(engine)
+            return result
+        } catch {
+            await waitUntilIdleIfLastBorrow(engine)
+            throw error
+        }
+    }
+
+    private func waitUntilIdleIfLastBorrow(_ engine: any InferenceEngine) async {
+        guard state.withLock({ $0.activeBorrows == 1 }) else { return }
+        await engine.waitUntilIdle()
     }
 
     // MARK: - ResourceManaging

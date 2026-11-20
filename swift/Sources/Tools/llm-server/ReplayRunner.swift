@@ -36,6 +36,9 @@ enum ReplayRunner {
                 lines[i] = await oneLine(req, state: state)
             }
         }
+        // The process exits after the replay, and a reply that ended at a stop string left the
+        // engine still draining it.
+        await state.engine.waitUntilIdle()
 
         let output = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
         if let outputPath {

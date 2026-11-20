@@ -456,10 +456,6 @@ public struct CoreAILanguageModel: LanguageModel {
                             reasoningTokenCount: reasoningTokenCount
                         )
                     )))
-
-            // Yield to let the engine's tokenSequence Task finish cleanup
-            // (putBackEngine, state reset, etc.) before the next respond().
-            await Task.yield()
         }
 
         // MARK: - Event Dispatch
@@ -582,10 +578,6 @@ public struct CoreAILanguageModel: LanguageModel {
                             reasoningTokenCount: 0
                         )
                     )))
-
-            // Yield to let the engine's tokenSequence Task finish cleanup
-            // (putBackEngine, state reset, etc.) before the next respond().
-            await Task.yield()
         }
 
         // MARK: - Transcript → Tokens

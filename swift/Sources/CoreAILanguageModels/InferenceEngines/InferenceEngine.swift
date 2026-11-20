@@ -215,6 +215,15 @@ public protocol InferenceEngine: Sendable {
     /// For push-based engines (pipelined), also cancels the background Task.
     func cancel() async throws
 
+    /// Wait until the work of the last `generate()` has finished, without cancelling it.
+    ///
+    /// A reader that stops early, at a stop string or with `break`, ends the stream while a push-based
+    /// engine (pipelined) is still draining its GPU work and putting its state back. Call this before
+    /// handing the engine to someone else, releasing it, or letting the process exit: an exit in that
+    /// window can abort in Metal's teardown. Unlike ``cancel()``, the generation ends the way it would
+    /// have, so the KV cache and prefix history stay valid for the next request.
+    func waitUntilIdle() async
+
     // MARK: - Capabilities
 
     /// Whether this engine supports per-step logits extraction.
@@ -320,6 +329,10 @@ extension InferenceEngine {
 
     /// Default: no-op cancel. Engines with active generation override this.
     public func cancel() async throws {}
+
+    /// Default: nothing to wait for. Pull-based engines do their work inside `next()`, so it is done
+    /// when the reader stops.
+    public func waitUntilIdle() async {}
 }
 
 extension InferenceEngine {
